@@ -1,0 +1,6 @@
+{
+  "name": "Web Desktop Emulator",
+  "description": "A lightweight x86 desktop OS emulator running entirely in the browser using v86, optimized for TinyCore Linux and Puppy Linux graphical setups.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
