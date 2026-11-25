@@ -62,6 +62,18 @@ export interface V86ImageSource {
   use_parts?: boolean;
 }
 
+export type WebServerEngine = 'busybox' | 'python3' | 'php';
+
+export interface SharedHostFile {
+  name: string;
+  folder: 'ipad' | 'www';
+  size: number;
+  mimeType: string;
+  updatedAt: number;
+  syncedTo9p: boolean;
+  data: Uint8Array;
+}
+
 export interface V86Config {
   wasm_path: string;
   memory_size: number;
@@ -71,6 +83,7 @@ export interface V86Config {
   vga_bios: V86ImageSource;
   cdrom?: V86ImageSource;
   hda?: V86ImageSource;
+  hdb?: V86ImageSource;
   fda?: V86ImageSource;
   bzimage?: V86ImageSource;
   initrd?: V86ImageSource;
@@ -97,8 +110,22 @@ export interface V86Bus {
   send: (name: string, data?: unknown) => void;
 }
 
+export interface V86Fs9pInode {
+  mode?: number;
+  size?: number;
+  direntries?: Map<string, number>;
+}
+
+export interface V86Fs9p {
+  inodes?: V86Fs9pInode[];
+  SearchPath?: (path: string) => { id: number; parentid: number; name: string };
+  CreateDirectory?: (name: string, parentid: number) => number;
+  read_dir?: (path: string) => string[];
+}
+
 export interface V86Instance {
   bus?: V86Bus;
+  fs9p?: V86Fs9p;
   run: () => Promise<void> | void;
   stop: () => Promise<void> | void;
   destroy: () => Promise<void> | void;
@@ -106,6 +133,9 @@ export interface V86Instance {
   is_running: () => boolean;
   save_state: () => Promise<ArrayBuffer>;
   restore_state: (state: ArrayBuffer) => Promise<void>;
+  create_file?: (file: string, data: Uint8Array) => Promise<void>;
+  read_file?: (file: string) => Promise<Uint8Array>;
+  serial0_send?: (data: string) => void;
   get_instruction_counter: () => number;
   lock_mouse: () => Promise<void> | void;
   mouse_set_enabled: (enabled: boolean) => void;

@@ -65,13 +65,15 @@ export function createPuppyV86Config({
       'nolapic',
       'tsc=reliable',
       'mitigations=off',
-      'vga=791',
     ].join(' '),
 
     net_device: {
       type: netDeviceType,
       relay_url: networkRelayUrl,
     },
+
+    // Enable live VirtIO 9p share (mount -t 9p -o trans=virtio,version=9p2000.L host9p /mnt/ipad)
+    filesystem: {},
 
     autostart: true,
     acpi: false,

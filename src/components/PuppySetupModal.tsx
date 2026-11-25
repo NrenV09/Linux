@@ -12,7 +12,7 @@ interface PuppySetupModalProps {
 }
 
 const DEFAULT_PUPPY_CMDLINE =
-  'pfix=ram,nocopy pmedia=cd acpi=off noapic nolapic tsc=reliable mitigations=off vga=791';
+  'pfix=ram,nocopy pmedia=cd acpi=off noapic nolapic tsc=reliable mitigations=off';
 
 const DIRECTORY_LAYOUT = `repo-root/
 ├── index.html                  # Standalone v86 iPadOS WebKit entry point

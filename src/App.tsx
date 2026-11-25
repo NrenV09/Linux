@@ -15,8 +15,10 @@ import type {
   PresetKind,
   PuppyDirectBootParams,
   SavedSnapshotMeta,
+  SharedHostFile,
   V86Config,
   V86Instance,
+  WebServerEngine,
 } from './types/v86';
 import {
   BOOT_ORDER,
@@ -31,10 +33,24 @@ import {
   loadSnapshotFromDb,
   saveSnapshotToDb,
 } from './lib/snapshotDb';
+import {
+  buildAutoNetworkScript,
+  buildFat16DiskImage,
+  buildMount9pScript,
+  buildWebServerScript,
+  createDefaultWebFiles,
+  encodeUtf8,
+  guessMimeType,
+  listVm9pDirectory,
+  readFileFromVm9p,
+  sanitizeGuestFilename,
+  writeFileToVm9p,
+} from './lib/guestBridge';
 import { EmulatorToolbar } from './components/EmulatorToolbar';
 import { VirtualKeyboard } from './components/VirtualKeyboard';
 import { TouchMouseBar } from './components/TouchMouseBar';
 import { PuppySetupModal } from './components/PuppySetupModal';
+import { GuestToolsModal } from './components/GuestToolsModal';
 
 interface ToastMessage {
   id: number;
@@ -137,7 +153,33 @@ export default function App() {
   const [memoryMb, setMemoryMb] = useState<number>(DEFAULT_PRESET.recommendedRamMb);
   const [vramMb, setVramMb] = useState<number>(DEFAULT_PRESET.recommendedVramMb ?? 8);
   const [networkEnabled, setNetworkEnabled] = useState<boolean>(true);
+  const [netDeviceType, setNetDeviceType] = useState<'ne2k' | 'virtio'>('ne2k');
+  const [networkRelayUrl, setNetworkRelayUrl] = useState<string>('fetch');
+  const [attachTransferDrive, setAttachTransferDrive] = useState<boolean>(false);
   const [activeImageLabel, setActiveImageLabel] = useState<string>(DEFAULT_PRESET.name);
+
+  const [sharedFiles, setSharedFiles] = useState<SharedHostFile[]>(() => createDefaultWebFiles());
+  const sharedFilesRef = useRef<SharedHostFile[]>(sharedFiles);
+  const activeBootKindRef = useRef<PresetKind>('state-9p');
+  const lastBootOptionsRef = useRef<{
+    kind: PresetKind;
+    sourceUrl?: string;
+    localFile?: File | null;
+    vmlinuzFile?: File | null;
+    initrdFile?: File | null;
+    device: BootDevice;
+    ramMb: number;
+    vramMb: number;
+    sizeHint?: number;
+    label: string;
+    cmdline?: string;
+    filesystemBaseUrl?: string;
+    netDeviceType?: 'virtio' | 'ne2k';
+    networkRelayUrl?: string;
+    bootHint?: string;
+  } | null>(null);
+  const [webServerEngine, setWebServerEngine] = useState<WebServerEngine>('busybox');
+  const [webServerPort, setWebServerPort] = useState<number>(8080);
 
   const [crispScaling, setCrispScaling] = useState(true);
   const [dragMode, setDragMode] = useState(false);
@@ -147,8 +189,16 @@ export default function App() {
   const [isPointerLocked, setIsPointerLocked] = useState(false);
   const [showKeyboard, setShowKeyboard] = useState(false);
   const [showPuppyModal, setShowPuppyModal] = useState(false);
+  const [guestToolsState, setGuestToolsState] = useState<{
+    open: boolean;
+    tab: 'network' | 'files' | 'web';
+  }>({ open: false, tab: 'network' });
   const [openMenu, setOpenMenu] = useState<'config' | 'state' | null>(null);
   const [isDragOver, setIsDragOver] = useState(false);
+
+  useEffect(() => {
+    sharedFilesRef.current = sharedFiles;
+  }, [sharedFiles]);
 
   const [snapshots, setSnapshots] = useState<SavedSnapshotMeta[]>([]);
   const [isSavingState, setIsSavingState] = useState(false);
@@ -462,6 +512,46 @@ export default function App() {
     };
   }, []);
 
+  const get9pPrefix = useCallback(() => {
+    return activeBootKindRef.current === 'state-9p' ? '/mnt/ipad' : '';
+  }, []);
+
+  const syncAllFilesToVm9p = useCallback(
+    async (emu: V86Instance) => {
+      const prefix = get9pPrefix();
+      // Write ready-to-run helper scripts into the live 9p share
+      await Promise.all([
+        writeFileToVm9p(emu, `${prefix}/net-auto.sh`, encodeUtf8(buildAutoNetworkScript())),
+        writeFileToVm9p(emu, `${prefix}/mount-ipad.sh`, encodeUtf8(buildMount9pScript())),
+        writeFileToVm9p(
+          emu,
+          `${prefix}/websrv.sh`,
+          encodeUtf8(buildWebServerScript(webServerEngine, webServerPort))
+        ),
+      ]);
+
+      const currentFiles = sharedFilesRef.current;
+      const results = await Promise.all(
+        currentFiles.map(async (file) => {
+          const targetPath =
+            file.folder === 'www' ? `${prefix}/www/${file.name}` : `${prefix}/${file.name}`;
+          const ok = await writeFileToVm9p(emu, targetPath, file.data);
+          return { key: `${file.folder}:${file.name}`, ok };
+        })
+      );
+
+      const syncedKeys = new Set(results.filter((r) => r.ok).map((r) => r.key));
+      if (syncedKeys.size > 0) {
+        setSharedFiles((prev) =>
+          prev.map((f) =>
+            syncedKeys.has(`${f.folder}:${f.name}`) ? { ...f, syncedTo9p: true } : f
+          )
+        );
+      }
+    },
+    [get9pPrefix, webServerEngine, webServerPort]
+  );
+
   const bootEmulator = useCallback(
     async (options: {
       kind: PresetKind;
@@ -480,6 +570,7 @@ export default function App() {
       networkRelayUrl?: string;
       bootHint?: string;
       initialStateBuffer?: ArrayBuffer;
+      forceAttachDrive?: boolean;
     }) => {
       if (!window.V86 || !screenRef.current) {
         showToast('v86 engine is still loading.', 'error');
@@ -492,6 +583,24 @@ export default function App() {
       setStatus('loading');
       setIps(0);
       setActiveImageLabel(options.label);
+      activeBootKindRef.current = options.kind;
+      lastBootOptionsRef.current = {
+        kind: options.kind,
+        sourceUrl: options.sourceUrl,
+        localFile: options.localFile,
+        vmlinuzFile: options.vmlinuzFile,
+        initrdFile: options.initrdFile,
+        device: options.device,
+        ramMb: options.ramMb,
+        vramMb: options.vramMb,
+        sizeHint: options.sizeHint,
+        label: options.label,
+        cmdline: options.cmdline,
+        filesystemBaseUrl: options.filesystemBaseUrl,
+        netDeviceType: options.netDeviceType,
+        networkRelayUrl: options.networkRelayUrl,
+        bootHint: options.bootHint,
+      };
 
       await destroyCurrentEmulator();
 
@@ -545,19 +654,42 @@ export default function App() {
           disable_mouse: true,
         };
 
-        if (options.kind === 'puppy-direct') {
+        // Automatic network configuration on ALL Puppy Linux & local ISOs (ne2k_pci + fetch auto-DHCP by default)
+        const shouldAttachNet =
+          networkEnabled || options.kind === 'puppy-direct' || Boolean(options.localFile);
+        if (shouldAttachNet) {
           config.net_device = {
-            type: options.netDeviceType ?? 'ne2k',
-            relay_url: options.networkRelayUrl ?? 'fetch',
-          };
-        } else if (networkEnabled) {
-          config.net_device = {
-            type: options.netDeviceType ?? 'ne2k',
-            relay_url: options.networkRelayUrl ?? 'fetch',
+            type: options.netDeviceType ?? netDeviceType,
+            relay_url: options.networkRelayUrl ?? networkRelayUrl,
           };
         } else if (options.netDeviceType) {
           config.net_device = { type: options.netDeviceType };
         }
+
+        // Build compact 4MB MBR-partitioned FAT16 IPAD_FILES drive only when enabled or when user queued iPad files
+        const hasImportedIpadFiles = sharedFilesRef.current.some((f) => f.folder === 'ipad');
+        const shouldAttachFatDrive = Boolean(
+          options.forceAttachDrive || attachTransferDrive || hasImportedIpadFiles
+        );
+        const buildHelperDriveIfEnabled = () => {
+          if (!shouldAttachFatDrive) return undefined;
+          const currentFiles = sharedFilesRef.current;
+          const rootEntries = [
+            { name: 'net-auto.sh', data: encodeUtf8(buildAutoNetworkScript()) },
+            { name: 'mount-ipad.sh', data: encodeUtf8(buildMount9pScript()) },
+            {
+              name: 'websrv.sh',
+              data: encodeUtf8(buildWebServerScript(webServerEngine, webServerPort)),
+            },
+            ...currentFiles
+              .filter((f) => f.folder === 'ipad')
+              .map((f) => ({ name: f.name, data: f.data })),
+          ];
+          const wwwEntries = currentFiles
+            .filter((f) => f.folder === 'www')
+            .map((f) => ({ name: f.name, data: f.data }));
+          return buildFat16DiskImage(rootEntries, wwwEntries, 'IPAD_FILES');
+        };
 
         if (options.kind === 'state-9p') {
           if (options.filesystemBaseUrl) {
@@ -581,6 +713,12 @@ export default function App() {
             config.cdrom = { buffer: options.localFile, async: true };
           }
           config.cmdline = options.cmdline;
+          // Enable live 9p share (+ optional compact FAT16 drive if enabled/populated)
+          config.filesystem = {};
+          const fatDrive = buildHelperDriveIfEnabled();
+          if (fatDrive) {
+            config.hda = { buffer: fatDrive, async: false };
+          }
           if (options.initialStateBuffer) {
             config.initial_state = { buffer: options.initialStateBuffer };
           }
@@ -606,6 +744,16 @@ export default function App() {
               async: useAsyncFileBuffer,
             };
           }
+          // Attach live 9p share on local ISO boots (avoid extra VirtIO PCI device on legacy presets like DSL/Kolibri)
+          if (options.localFile && options.device !== 'fda') {
+            config.filesystem = {};
+          }
+          if (options.device === 'cdrom' && options.localFile) {
+            const fatDrive = buildHelperDriveIfEnabled();
+            if (fatDrive) {
+              config.hda = { buffer: fatDrive, async: false };
+            }
+          }
           if (options.initialStateBuffer) {
             config.initial_state = { buffer: options.initialStateBuffer };
           }
@@ -624,12 +772,19 @@ export default function App() {
         lastInstrRef.current = 0;
 
         let hintShown = false;
-        const markRunning = () => {
+        let synced9pOnce = false;
+        const markRunning = (allowSync9p: boolean) => {
           setDownloadProgress(null);
           setStatus('running');
           lastTickRef.current = performance.now();
           lastInstrRef.current = emulator.get_instruction_counter?.() ?? 0;
           window.requestAnimationFrame(() => fitScreenToViewport());
+          window.setTimeout(() => fitScreenToViewport(), 250);
+          // Only sync 9p AFTER emulator-loaded (never before restore_state!) and never mutate Arch state-9p on boot
+          if (allowSync9p && !synced9pOnce && options.kind !== 'state-9p' && config.filesystem) {
+            synced9pOnce = true;
+            void syncAllFilesToVm9p(emulator);
+          }
           if (!hintShown && options.bootHint) {
             hintShown = true;
             showToast(options.bootHint, 'info');
@@ -653,14 +808,17 @@ export default function App() {
           setDownloadProgress({ fileName, loaded, total, percent });
         });
 
-        emulator.add_listener('emulator-ready', markRunning);
-        emulator.add_listener('emulator-loaded', markRunning);
-        emulator.add_listener('emulator-started', markRunning);
+        // Wait for emulator-loaded / emulator-started (fires AFTER restore_state and v86.run())
+        emulator.add_listener('emulator-loaded', () => markRunning(true));
+        emulator.add_listener('emulator-started', () => markRunning(false));
 
-        emulator.add_listener('screen-set-size', () => {
+        // Real v86 ScreenAdapter resize/mode events
+        emulator.add_listener('screen-set-size-graphical', () => {
           window.requestAnimationFrame(() => fitScreenToViewport());
         });
-
+        emulator.add_listener('screen-set-size-text', () => {
+          window.requestAnimationFrame(() => fitScreenToViewport());
+        });
         emulator.add_listener('screen-set-mode', () => {
           window.requestAnimationFrame(() => fitScreenToViewport());
         });
@@ -690,12 +848,18 @@ export default function App() {
       }
     },
     [
+      attachTransferDrive,
       destroyCurrentEmulator,
       fitScreenToViewport,
       loadBiosBuffers,
+      netDeviceType,
       networkEnabled,
+      networkRelayUrl,
       resetScreenContainerDom,
       showToast,
+      syncAllFilesToVm9p,
+      webServerEngine,
+      webServerPort,
     ]
   );
 
@@ -788,10 +952,165 @@ export default function App() {
         ramMb: memoryMb,
         vramMb,
         label: file.name,
+        bootHint:
+          inferredDevice === 'cdrom'
+            ? 'Auto-network (ne2k_pci + DHCP) & IPAD_FILES drive (/dev/sda + 9p) attached.'
+            : undefined,
       });
     },
     [bootEmulator, memoryMb, vramMb]
   );
+
+  const handleImportHostFiles = useCallback(
+    async (fileList: FileList | File[], folder: 'ipad' | 'www') => {
+      const files = Array.from(fileList);
+      if (files.length === 0) return;
+
+      const emu = emulatorRef.current;
+      const prefix = get9pPrefix();
+      const imported: SharedHostFile[] = [];
+
+      for (const file of files) {
+        const safeName = sanitizeGuestFilename(file.name);
+        const buf = await file.arrayBuffer();
+        const data = new Uint8Array(buf);
+        const targetPath = folder === 'www' ? `${prefix}/www/${safeName}` : `${prefix}/${safeName}`;
+        const synced = emu ? await writeFileToVm9p(emu, targetPath, data) : false;
+
+        imported.push({
+          name: safeName,
+          folder,
+          size: data.byteLength,
+          mimeType: file.type || guessMimeType(safeName),
+          updatedAt: Date.now(),
+          syncedTo9p: synced,
+          data,
+        });
+      }
+
+      setSharedFiles((prev) => {
+        const map = new Map<string, SharedHostFile>();
+        for (const f of prev) map.set(`${f.folder}:${f.name}`, f);
+        for (const f of imported) map.set(`${f.folder}:${f.name}`, f);
+        return Array.from(map.values());
+      });
+
+      const syncedCount = imported.filter((f) => f.syncedTo9p).length;
+      showToast(
+        syncedCount > 0
+          ? `Imported ${imported.length} file(s) and synced live to 9p (${folder === 'www' ? '/mnt/ipad/www' : '/mnt/ipad'}).`
+          : `Queued ${imported.length} iPad file(s) for /dev/sda (IPAD_FILES) & 9p share.`,
+        'success'
+      );
+    },
+    [get9pPrefix, showToast]
+  );
+
+  const handleSaveWebFile = useCallback(
+    async (name: string, content: string) => {
+      const safeName = sanitizeGuestFilename(name);
+      const data = encodeUtf8(content);
+      const emu = emulatorRef.current;
+      const prefix = get9pPrefix();
+      const synced = emu ? await writeFileToVm9p(emu, `${prefix}/www/${safeName}`, data) : false;
+
+      const updated: SharedHostFile = {
+        name: safeName,
+        folder: 'www',
+        size: data.byteLength,
+        mimeType: guessMimeType(safeName),
+        updatedAt: Date.now(),
+        syncedTo9p: synced,
+        data,
+      };
+
+      setSharedFiles((prev) => {
+        const filtered = prev.filter((f) => !(f.folder === 'www' && f.name === safeName));
+        return [...filtered, updated];
+      });
+      showToast(
+        synced
+          ? `Saved ${safeName} and synced live to /mnt/ipad/www.`
+          : `Saved ${safeName} in web root.`,
+        'success'
+      );
+    },
+    [get9pPrefix, showToast]
+  );
+
+  const handleDeleteSharedFile = useCallback((name: string, folder: 'ipad' | 'www') => {
+    setSharedFiles((prev) => prev.filter((f) => !(f.folder === folder && f.name === name)));
+  }, []);
+
+  const handlePullFromVm9p = useCallback(
+    async (folder: 'ipad' | 'www'): Promise<number> => {
+      const emu = emulatorRef.current;
+      if (!emu) return 0;
+      const prefix = get9pPrefix();
+      const dirPath = folder === 'www' ? `${prefix}/www` : prefix || '/';
+      const names = listVm9pDirectory(emu, dirPath);
+      const skip = new Set(['www', 'net-auto.sh', 'mount-ipad.sh', 'websrv.sh']);
+      let pulled = 0;
+      const updates: SharedHostFile[] = [];
+
+      for (const name of names) {
+        if (folder === 'ipad' && skip.has(name)) continue;
+        const fullPath = dirPath === '/' ? `/${name}` : `${dirPath}/${name}`;
+        const bytes = await readFileFromVm9p(emu, fullPath);
+        if (bytes) {
+          pulled++;
+          updates.push({
+            name,
+            folder,
+            size: bytes.byteLength,
+            mimeType: guessMimeType(name),
+            updatedAt: Date.now(),
+            syncedTo9p: true,
+            data: bytes,
+          });
+        }
+      }
+
+      if (updates.length > 0) {
+        setSharedFiles((prev) => {
+          const map = new Map<string, SharedHostFile>();
+          for (const f of prev) map.set(`${f.folder}:${f.name}`, f);
+          for (const f of updates) map.set(`${f.folder}:${f.name}`, f);
+          return Array.from(map.values());
+        });
+        showToast(`Synced ${pulled} live file(s) from VM 9p share.`, 'success');
+      } else {
+        showToast('No new files detected in live 9p share.', 'info');
+      }
+      return pulled;
+    },
+    [get9pPrefix, showToast]
+  );
+
+  const handleRunGuestCommand = useCallback(
+    (command: string, label: string) => {
+      const emu = emulatorRef.current;
+      if (!emu || status !== 'running') {
+        showToast('Start a Linux/Puppy VM first before sending guest commands.', 'error');
+        return;
+      }
+      emu.keyboard_set_enabled?.(true);
+      void emu.keyboard_send_text?.(command);
+      showToast(`Sent "${label}" to focused guest terminal.`, 'success');
+    },
+    [showToast, status]
+  );
+
+  const handleRebootWithUpdatedDrive = useCallback(() => {
+    const last = lastBootOptionsRef.current;
+    if (!last) {
+      showToast('No active VM boot configuration to reboot.', 'error');
+      return;
+    }
+    setAttachTransferDrive(true);
+    void bootEmulator({ ...last, forceAttachDrive: true });
+    showToast('Rebuilt IPAD_FILES (/dev/sda1) FAT16 drive and rebooting VM.', 'info');
+  }, [bootEmulator, showToast]);
 
   const handleBootPuppyDirect = useCallback(
     (params: PuppyDirectBootParams) => {
@@ -801,6 +1120,8 @@ export default function App() {
       setBootDevice('cdrom');
       setMemoryMb(safeRamMb);
       setVramMb(params.vramMb);
+      setNetDeviceType(params.netDeviceType);
+      setNetworkRelayUrl(params.networkRelayUrl);
       void bootEmulator({
         kind: 'puppy-direct',
         localFile: params.isoFile,
@@ -814,7 +1135,7 @@ export default function App() {
         netDeviceType: params.netDeviceType,
         networkRelayUrl: params.networkRelayUrl,
         bootHint:
-          'Puppy Linux direct kernel boot started (pfix=ram,nocopy + async ISO streaming).',
+          'Puppy direct boot active: auto-network, live 9p (/mnt/ipad), and IPAD_FILES (/dev/sda) attached.',
       });
     },
     [bootEmulator]
@@ -1363,11 +1684,14 @@ export default function App() {
   const handleDrop = (e: React.DragEvent<HTMLDivElement>) => {
     e.preventDefault();
     setIsDragOver(false);
-    const file = e.dataTransfer.files?.[0];
-    if (file && /\.(iso|img|bin)$/i.test(file.name)) {
-      handleUploadIso(file);
-    } else if (file) {
-      showToast('Drop a bootable .iso, .img, or .bin disk image.', 'error');
+    const files = e.dataTransfer.files;
+    if (!files || files.length === 0) return;
+    const first = files[0];
+    if (files.length === 1 && /\.(iso|img|bin)$/i.test(first.name)) {
+      handleUploadIso(first);
+    } else {
+      void handleImportHostFiles(files, 'ipad');
+      setGuestToolsState({ open: true, tab: 'files' });
     }
   };
 
@@ -1447,6 +1771,10 @@ export default function App() {
         onOpenPuppySetup={() => {
           setOpenMenu(null);
           setShowPuppyModal(true);
+        }}
+        onOpenGuestTools={(tab = 'network') => {
+          setOpenMenu(null);
+          setGuestToolsState({ open: true, tab });
         }}
         onInputFocusChange={handleInputFocusChange}
       />
@@ -1766,6 +2094,34 @@ export default function App() {
         v86Ready={v86Ready}
         onClose={() => setShowPuppyModal(false)}
         onBootPuppyDirect={handleBootPuppyDirect}
+        onInputFocusChange={handleInputFocusChange}
+      />
+
+      {/* Auto-Network, iPad File Bridge (9p + FAT16) & In-VM Web Server Modal */}
+      <GuestToolsModal
+        open={guestToolsState.open}
+        initialTab={guestToolsState.tab}
+        status={status}
+        networkEnabled={networkEnabled}
+        netDeviceType={netDeviceType}
+        networkRelayUrl={networkRelayUrl}
+        attachTransferDrive={attachTransferDrive}
+        sharedFiles={sharedFiles}
+        webServerEngine={webServerEngine}
+        webServerPort={webServerPort}
+        onClose={() => setGuestToolsState((prev) => ({ ...prev, open: false }))}
+        onToggleNetwork={() => setNetworkEnabled((prev) => !prev)}
+        onNetDeviceTypeChange={setNetDeviceType}
+        onNetworkRelayUrlChange={setNetworkRelayUrl}
+        onToggleTransferDrive={() => setAttachTransferDrive((prev) => !prev)}
+        onWebServerEngineChange={setWebServerEngine}
+        onWebServerPortChange={setWebServerPort}
+        onImportHostFiles={handleImportHostFiles}
+        onSaveWebFile={handleSaveWebFile}
+        onDeleteSharedFile={handleDeleteSharedFile}
+        onPullFromVm9p={handlePullFromVm9p}
+        onRunGuestCommand={handleRunGuestCommand}
+        onRebootWithUpdatedDrive={handleRebootWithUpdatedDrive}
         onInputFocusChange={handleInputFocusChange}
       />
     </div>

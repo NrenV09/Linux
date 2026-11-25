@@ -19,6 +19,7 @@ import {
   Move,
   Hand,
   Cpu,
+  Globe,
 } from 'lucide-react';
 import type {
   BootDevice,
@@ -73,6 +74,7 @@ interface EmulatorToolbarProps {
   onToggleFullscreen: () => void;
   onToggleKeyboard: () => void;
   onOpenPuppySetup: () => void;
+  onOpenGuestTools: (tab?: 'network' | 'files' | 'web') => void;
   onInputFocusChange: (focused: boolean) => void;
 }
 
@@ -129,6 +131,7 @@ export const EmulatorToolbar: React.FC<EmulatorToolbarProps> = ({
   onToggleFullscreen,
   onToggleKeyboard,
   onOpenPuppySetup,
+  onOpenGuestTools,
   onInputFocusChange,
 }) => {
   const isoInputRef = useRef<HTMLInputElement>(null);
@@ -244,6 +247,17 @@ export const EmulatorToolbar: React.FC<EmulatorToolbarProps> = ({
           >
             <Cpu className="w-3.5 h-3.5 text-emerald-400" />
             <span>Puppy iPadOS</span>
+          </button>
+
+          {/* Auto-Network, iPad Files & Web Server Studio */}
+          <button
+            type="button"
+            onClick={() => onOpenGuestTools('network')}
+            title="Auto-network setup, import local iPad files into Puppy Linux, and run an in-VM web server"
+            className={`${btnBase} bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700`}
+          >
+            <Globe className="w-3.5 h-3.5 text-sky-400" />
+            <span>Net · Files · Web</span>
           </button>
 
           {/* Hardware / Image Configuration Drawer Toggle */}
