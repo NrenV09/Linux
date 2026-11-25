@@ -16,7 +16,13 @@ import type {
   V86Config,
   V86Instance,
 } from './types/v86';
-import { OS_PRESETS, V86_ASSETS, formatBytes } from './lib/presets';
+import {
+  BOOT_ORDER,
+  OS_PRESETS,
+  V86_ASSETS,
+  fetchBinaryWithProgress,
+  formatBytes,
+} from './lib/presets';
 import {
   deleteSnapshotFromDb,
   listSnapshotsFromDb,
@@ -44,10 +50,13 @@ interface SafariElement extends HTMLElement {
 const DEFAULT_PRESET = OS_PRESETS[0];
 
 export default function App() {
+  const viewportRef = useRef<HTMLElement>(null);
   const screenRef = useRef<HTMLDivElement>(null);
   const emulatorRef = useRef<V86Instance | null>(null);
   const localFileRef = useRef<File | null>(null);
   const fileDropInputRef = useRef<HTMLInputElement>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const biosCacheRef = useRef<{ bios: ArrayBuffer; vgaBios: ArrayBuffer } | null>(null);
 
   // Track IPS accurately with 32-bit wrap-around handling
   const lastInstrRef = useRef(0);
@@ -74,7 +83,9 @@ export default function App() {
     maxTouches: 0,
   });
 
-  const [v86Ready, setV86Ready] = useState<boolean>(() => typeof window !== 'undefined' && !!window.V86);
+  const [v86Ready, setV86Ready] = useState<boolean>(
+    () => typeof window !== 'undefined' && !!window.V86
+  );
   const [v86Error, setV86Error] = useState<string | null>(null);
   const [scriptAttempt, setScriptAttempt] = useState(0);
 
@@ -113,6 +124,51 @@ export default function App() {
     }, 4200);
     return () => window.clearTimeout(timer);
   }, [toast]);
+
+  // Scale v86 text/canvas output cleanly to fit viewport while preserving aspect ratio
+  const fitScreenToViewport = useCallback(() => {
+    const viewport = viewportRef.current;
+    const container = screenRef.current;
+    const emu = emulatorRef.current;
+    if (!viewport || !container || !emu) return;
+
+    const vw = viewport.clientWidth;
+    const vh = viewport.clientHeight;
+    if (vw <= 0 || vh <= 0) return;
+
+    const canvas = container.querySelector('canvas');
+    const textEl = container.querySelector('div');
+
+    if (canvas && canvas.style.display !== 'none' && canvas.width > 0 && canvas.height > 0) {
+      const scale = Math.min(vw / canvas.width, vh / canvas.height);
+      const targetW = Math.max(1, Math.floor(canvas.width * scale));
+      const targetH = Math.max(1, Math.floor(canvas.height * scale));
+      canvas.style.width = `${targetW}px`;
+      canvas.style.height = `${targetH}px`;
+      return;
+    }
+
+    if (textEl && textEl.style.display !== 'none') {
+      textEl.style.transform = '';
+      const rect = textEl.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) {
+        const scale = Math.min(vw / rect.width, vh / rect.height, 2);
+        textEl.style.transform = scale !== 1 ? `scale(${scale.toFixed(4)})` : '';
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    const onResize = () => fitScreenToViewport();
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, [fitScreenToViewport]);
+
+  // Re-fit display when virtual keyboard toggles
+  useEffect(() => {
+    const id = window.requestAnimationFrame(() => fitScreenToViewport());
+    return () => window.cancelAnimationFrame(id);
+  }, [showKeyboard, isFullscreen, fitScreenToViewport]);
 
   // StrictMode-safe libv86.js script loader
   useEffect(() => {
@@ -170,9 +226,10 @@ export default function App() {
     refreshSnapshots();
   }, [refreshSnapshots]);
 
-  // Cleanly destroy VM on unmount
+  // Cleanly abort downloads and destroy VM on unmount
   useEffect(() => {
     return () => {
+      abortControllerRef.current?.abort();
       if (emulatorRef.current) {
         void emulatorRef.current.destroy();
         emulatorRef.current = null;
@@ -180,7 +237,7 @@ export default function App() {
     };
   }, []);
 
-  // Poll IPS once per second without burning animation frames
+  // Poll IPS once per second
   useEffect(() => {
     if (status !== 'running') {
       setIps(0);
@@ -198,7 +255,6 @@ export default function App() {
       if (elapsedSec > 0.1) {
         let deltaInstr = instr - lastInstrRef.current;
         if (deltaInstr < 0) {
-          // Handle unsigned 32-bit counter wrap-around
           deltaInstr += 0x100000000;
         }
         setIps(Math.max(0, Math.round(deltaInstr / elapsedSec)));
@@ -242,6 +298,9 @@ export default function App() {
   }, []);
 
   const destroyCurrentEmulator = useCallback(async () => {
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = null;
+
     const emu = emulatorRef.current;
     emulatorRef.current = null;
     if (emu) {
@@ -253,6 +312,26 @@ export default function App() {
     }
     resetScreenContainerDom();
   }, [resetScreenContainerDom]);
+
+  const loadBiosBuffers = useCallback(async (signal: AbortSignal) => {
+    if (biosCacheRef.current) {
+      return {
+        bios: biosCacheRef.current.bios.slice(0),
+        vgaBios: biosCacheRef.current.vgaBios.slice(0),
+      };
+    }
+
+    const [bios, vgaBios] = await Promise.all([
+      fetchBinaryWithProgress(V86_ASSETS.biosUrl, { signal }),
+      fetchBinaryWithProgress(V86_ASSETS.vgaBiosUrl, { signal }),
+    ]);
+
+    biosCacheRef.current = { bios, vgaBios };
+    return {
+      bios: bios.slice(0),
+      vgaBios: vgaBios.slice(0),
+    };
+  }, []);
 
   const bootEmulator = useCallback(
     async (options: {
@@ -278,51 +357,77 @@ export default function App() {
 
       await destroyCurrentEmulator();
 
-      if (!screenRef.current) return;
-
-      const config: V86Config = {
-        wasm_path: V86_ASSETS.wasmUrl,
-        memory_size: options.ramMb * 1024 * 1024,
-        vga_memory_size: 16 * 1024 * 1024,
-        screen_container: screenRef.current,
-        bios: { url: V86_ASSETS.biosUrl },
-        vga_bios: { url: V86_ASSETS.vgaBiosUrl },
-        autostart: true,
-        acpi: false,
-        disable_jit: false,
-      };
-
-      if (options.initialStateBuffer) {
-        config.initial_state = { buffer: options.initialStateBuffer };
-      }
-
-      if (options.localFile) {
-        config[options.device] = {
-          buffer: options.localFile,
-          async: false,
-        };
-      } else if (options.sourceUrl) {
-        config[options.device] = {
-          url: options.sourceUrl,
-          size: options.sizeHint,
-          async: false,
-        };
-      }
-
-      // Prioritize chosen boot medium in SeaBIOS boot order
-      if (options.device === 'cdrom') {
-        config.boot_order = 0x123; // CD, Floppy, HD
-      } else if (options.device === 'hda') {
-        config.boot_order = 0x213; // HD, CD, Floppy
-      } else {
-        config.boot_order = 0x312; // Floppy, CD, HD
-      }
+      const controller = new AbortController();
+      abortControllerRef.current = controller;
 
       try {
+        setDownloadProgress({
+          fileName: 'SeaBIOS & VGA BIOS',
+          loaded: 0,
+          total: 0,
+          percent: null,
+        });
+        const { bios, vgaBios } = await loadBiosBuffers(controller.signal);
+
+        let imageBuffer: ArrayBuffer | File | undefined;
+        if (options.localFile) {
+          imageBuffer = options.localFile;
+        } else if (options.sourceUrl) {
+          imageBuffer = await fetchBinaryWithProgress(options.sourceUrl, {
+            expectedSize: options.sizeHint,
+            signal: controller.signal,
+            onProgress: (prog) => setDownloadProgress(prog),
+          });
+        }
+
+        if (controller.signal.aborted || !screenRef.current) return;
+
+        // Ensure fresh text/canvas layers exist right before ScreenAdapter attaches
+        resetScreenContainerDom();
+
+        const config: V86Config = {
+          wasm_path: V86_ASSETS.wasmUrl,
+          memory_size: options.ramMb * 1024 * 1024,
+          vga_memory_size: 8 * 1024 * 1024,
+          screen_container: screenRef.current,
+          bios: { buffer: bios },
+          vga_bios: { buffer: vgaBios },
+          boot_order: BOOT_ORDER[options.device],
+          autostart: true,
+          acpi: false,
+          disable_jit: false,
+        };
+
+        if (options.initialStateBuffer) {
+          config.initial_state = { buffer: options.initialStateBuffer };
+        }
+
+        if (imageBuffer) {
+          config[options.device] = {
+            buffer: imageBuffer,
+            async: false,
+          };
+        }
+
+        setDownloadProgress({
+          fileName: 'v86.wasm',
+          loaded: 0,
+          total: 0,
+          percent: null,
+        });
+
         const emulator = new window.V86(config);
         emulatorRef.current = emulator;
         lastTickRef.current = performance.now();
         lastInstrRef.current = 0;
+
+        const markRunning = () => {
+          setDownloadProgress(null);
+          setStatus('running');
+          lastTickRef.current = performance.now();
+          lastInstrRef.current = emulator.get_instruction_counter?.() ?? 0;
+          window.requestAnimationFrame(() => fitScreenToViewport());
+        };
 
         emulator.add_listener('download-progress', (rawEvent: unknown) => {
           const ev = rawEvent as {
@@ -333,7 +438,7 @@ export default function App() {
           };
           const loaded = ev.loaded ?? 0;
           const total = ev.total ?? 0;
-          const fileName = (ev.file_name ?? 'image').split('/').pop() || 'image';
+          const fileName = (ev.file_name ?? 'v86.wasm').split('/').pop() || 'v86.wasm';
           const percent =
             ev.lengthComputable && total > 0
               ? Math.min(100, Math.round((loaded / total) * 100))
@@ -341,18 +446,16 @@ export default function App() {
           setDownloadProgress({ fileName, loaded, total, percent });
         });
 
-        emulator.add_listener('emulator-ready', () => {
-          setDownloadProgress(null);
-          setStatus('running');
-          lastTickRef.current = performance.now();
-          lastInstrRef.current = emulator.get_instruction_counter?.() ?? 0;
+        emulator.add_listener('emulator-ready', markRunning);
+        emulator.add_listener('emulator-loaded', markRunning);
+        emulator.add_listener('emulator-started', markRunning);
+
+        emulator.add_listener('screen-set-size', () => {
+          window.requestAnimationFrame(() => fitScreenToViewport());
         });
 
-        emulator.add_listener('emulator-started', () => {
-          setDownloadProgress(null);
-          setStatus('running');
-          lastTickRef.current = performance.now();
-          lastInstrRef.current = emulator.get_instruction_counter?.() ?? 0;
+        emulator.add_listener('screen-set-mode', () => {
+          window.requestAnimationFrame(() => fitScreenToViewport());
         });
 
         emulator.add_listener('emulator-stopped', () => {
@@ -365,16 +468,27 @@ export default function App() {
           setDownloadProgress(null);
           setStatus('error');
           setErrorMessage(
-            `Failed to download boot image${failedFile}. Remote servers without CORS headers are blocked by browsers. Download the ISO locally and use "Load Local ISO" to boot completely offline.`
+            `Failed to download runtime asset${failedFile}. Check network access or load an ISO locally.`
           );
         });
       } catch (err) {
-        const message = err instanceof Error ? err.message : 'Unexpected WebAssembly initialization failure.';
+        if (controller.signal.aborted) return;
+        const message =
+          err instanceof Error
+            ? err.message
+            : 'Unexpected network or WebAssembly initialization failure.';
+        setDownloadProgress(null);
         setStatus('error');
         setErrorMessage(message);
       }
     },
-    [destroyCurrentEmulator, showToast]
+    [
+      destroyCurrentEmulator,
+      fitScreenToViewport,
+      loadBiosBuffers,
+      resetScreenContainerDom,
+      showToast,
+    ]
   );
 
   const handlePowerOn = useCallback(() => {
@@ -527,6 +641,7 @@ export default function App() {
           await emu.run();
           setStatus('running');
           setOpenMenu(null);
+          window.requestAnimationFrame(() => fitScreenToViewport());
           showToast(`Restored "${record.name}".`, 'success');
         } else {
           const preset = OS_PRESETS.find((p) => p.id === selectedPresetId);
@@ -549,7 +664,15 @@ export default function App() {
         showToast(msg, 'error');
       }
     },
-    [bootDevice, bootEmulator, customIsoUrl, selectedPresetId, showToast, status]
+    [
+      bootDevice,
+      bootEmulator,
+      customIsoUrl,
+      fitScreenToViewport,
+      selectedPresetId,
+      showToast,
+      status,
+    ]
   );
 
   const handleDeleteSnapshotDb = useCallback(
@@ -601,6 +724,7 @@ export default function App() {
           await emu.run();
           setStatus('running');
           setOpenMenu(null);
+          window.requestAnimationFrame(() => fitScreenToViewport());
           showToast(`Restored state from ${file.name}.`, 'success');
         } else {
           const preset = OS_PRESETS.find((p) => p.id === selectedPresetId);
@@ -623,7 +747,16 @@ export default function App() {
         showToast(msg, 'error');
       }
     },
-    [bootDevice, bootEmulator, customIsoUrl, memoryMb, selectedPresetId, showToast, status]
+    [
+      bootDevice,
+      bootEmulator,
+      customIsoUrl,
+      fitScreenToViewport,
+      memoryMb,
+      selectedPresetId,
+      showToast,
+      status,
+    ]
   );
 
   const handleTogglePointerLock = useCallback(() => {
@@ -668,7 +801,6 @@ export default function App() {
     }
   }, [showToast]);
 
-  // Pause v86 global keyboard hooks while typing in UI text fields
   const handleInputFocusChange = useCallback((focused: boolean) => {
     emulatorRef.current?.keyboard_set_enabled?.(!focused);
   }, []);
@@ -719,7 +851,6 @@ export default function App() {
     ts.maxTouches = Math.max(ts.maxTouches, e.touches.length);
 
     if (emu.bus && (dx !== 0 || dy !== 0)) {
-      // PS/2 Y axis is inverted relative to screen coordinates
       emu.bus.send('mouse-delta', [dx * 1.4, -dy * 1.4]);
     }
   };
@@ -733,11 +864,9 @@ export default function App() {
       const elapsed = performance.now() - ts.startTime;
       if (status === 'running' && emu?.bus && !ts.moved && elapsed < 300) {
         if (ts.maxTouches >= 2) {
-          // Two-finger tap -> right click
           emu.bus.send('mouse-click', [false, false, true]);
           window.setTimeout(() => emu.bus?.send('mouse-click', [false, false, false]), 45);
         } else {
-          // Single tap -> left click
           emu.bus.send('mouse-click', [true, false, false]);
           window.setTimeout(() => emu.bus?.send('mouse-click', [false, false, false]), 45);
         }
@@ -747,7 +876,6 @@ export default function App() {
     }
   };
 
-  // Drag & Drop local ISO support directly onto the viewport
   const handleDragOver = (e: React.DragEvent<HTMLDivElement>) => {
     e.preventDefault();
     setIsDragOver(true);
@@ -776,8 +904,6 @@ export default function App() {
     setV86Error(null);
     setScriptAttempt((n) => n + 1);
   };
-
-  const isViewportVisible = status === 'running' || status === 'paused' || status === 'loading';
 
   return (
     <div
@@ -844,6 +970,7 @@ export default function App() {
 
       {/* Main Display Viewport */}
       <main
+        ref={viewportRef}
         className="flex-1 relative bg-black flex items-center justify-center overflow-hidden min-h-0"
         onClick={() => {
           if (openMenu) setOpenMenu(null);
@@ -852,20 +979,20 @@ export default function App() {
         onTouchMove={handleTouchMove}
         onTouchEnd={handleTouchEnd}
       >
-        {/* v86 Screen Target (always mounted so ref is stable) */}
+        {/*
+          v86 Screen Target:
+          - Always rendered in layout (never display: none) so ScreenAdapter.getBoundingClientRect() never measures 0x0.
+          - Empty in JSX so React never reconciles or overwrites the imperative <div> and <canvas> managed by v86.
+        */}
         <div
           ref={screenRef}
           id="screen_container"
           className={`v86-screen-host ${crispScaling ? 'v86-crisp' : ''}`}
-          style={{ display: isViewportVisible ? 'flex' : 'none' }}
-        >
-          <div />
-          <canvas style={{ display: 'none' }} />
-        </div>
+        />
 
         {/* Boot / Image Download Progress Overlay */}
         {status === 'loading' && (
-          <div className="absolute inset-0 z-20 bg-[#090d16]/90 flex flex-col items-center justify-center px-6">
+          <div className="absolute inset-0 z-20 bg-[#090d16]/95 flex flex-col items-center justify-center px-6">
             <div className="w-full max-w-md space-y-3">
               <div className="flex items-center justify-between text-xs">
                 <span className="font-medium text-slate-200 truncate">
@@ -874,9 +1001,9 @@ export default function App() {
                 <span className="font-mono tabular-nums text-slate-400 shrink-0 ml-2">
                   {downloadProgress?.percent != null
                     ? `${downloadProgress.percent}%`
-                    : downloadProgress
+                    : downloadProgress && downloadProgress.loaded > 0
                       ? formatBytes(downloadProgress.loaded)
-                      : 'Initializing WASM'}
+                      : 'Preparing'}
                 </span>
               </div>
               <div className="h-1.5 w-full bg-slate-800 rounded-full overflow-hidden">
@@ -884,7 +1011,7 @@ export default function App() {
                   className="h-full bg-sky-500 transition-[width] duration-150"
                   style={{
                     width:
-                      downloadProgress?.percent != null ? `${downloadProgress.percent}%` : '35%',
+                      downloadProgress?.percent != null ? `${downloadProgress.percent}%` : '25%',
                   }}
                 />
               </div>
