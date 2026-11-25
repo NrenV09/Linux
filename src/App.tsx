@@ -1,311 +1,1096 @@
-import React, { useEffect, useRef, useState } from 'react';
-import { Power, Save, Upload, Maximize, MousePointer2, Keyboard, RotateCcw, AlertTriangle } from 'lucide-react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  AlertTriangle,
+  HardDriveUpload,
+  Monitor,
+  Play,
+  RefreshCw,
+  X,
+} from 'lucide-react';
+import type {
+  BootDevice,
+  DownloadProgress,
+  EmulatorStatus,
+  OSPreset,
+  SavedSnapshotMeta,
+  V86Config,
+  V86Instance,
+} from './types/v86';
+import { OS_PRESETS, V86_ASSETS, formatBytes } from './lib/presets';
+import {
+  deleteSnapshotFromDb,
+  listSnapshotsFromDb,
+  loadSnapshotFromDb,
+  saveSnapshotToDb,
+} from './lib/snapshotDb';
+import { EmulatorToolbar } from './components/EmulatorToolbar';
+import { VirtualKeyboard } from './components/VirtualKeyboard';
 
-declare global {
-  interface Window {
-    V86: any;
-  }
+interface ToastMessage {
+  id: number;
+  tone: 'info' | 'success' | 'error';
+  text: string;
 }
+
+interface SafariDocument extends Document {
+  webkitFullscreenElement?: Element | null;
+  webkitExitFullscreen?: () => Promise<void> | void;
+}
+
+interface SafariElement extends HTMLElement {
+  webkitRequestFullscreen?: () => Promise<void> | void;
+}
+
+const DEFAULT_PRESET = OS_PRESETS[0];
 
 export default function App() {
   const screenRef = useRef<HTMLDivElement>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const stateInputRef = useRef<HTMLInputElement>(null);
-  const emulatorRef = useRef<any>(null);
+  const emulatorRef = useRef<V86Instance | null>(null);
+  const localFileRef = useRef<File | null>(null);
+  const fileDropInputRef = useRef<HTMLInputElement>(null);
 
-  const [status, setStatus] = useState<'stopped' | 'running' | 'paused' | 'error'>('stopped');
+  // Track IPS accurately with 32-bit wrap-around handling
+  const lastInstrRef = useRef(0);
+  const lastTickRef = useRef(0);
+
+  // Touch-to-mouse gesture tracking
+  const touchStateRef = useRef<{
+    active: boolean;
+    startX: number;
+    startY: number;
+    lastX: number;
+    lastY: number;
+    moved: boolean;
+    startTime: number;
+    maxTouches: number;
+  }>({
+    active: false,
+    startX: 0,
+    startY: 0,
+    lastX: 0,
+    lastY: 0,
+    moved: false,
+    startTime: 0,
+    maxTouches: 0,
+  });
+
+  const [v86Ready, setV86Ready] = useState<boolean>(() => typeof window !== 'undefined' && !!window.V86);
+  const [v86Error, setV86Error] = useState<string | null>(null);
+  const [scriptAttempt, setScriptAttempt] = useState(0);
+
+  const [status, setStatus] = useState<EmulatorStatus>('stopped');
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [downloadProgress, setDownloadProgress] = useState<DownloadProgress | null>(null);
   const [ips, setIps] = useState(0);
-  const [isoUrl, setIsoUrl] = useState('https://distro.ibiblio.org/tinycorelinux/14.x/x86/release/TinyCore-current.iso');
+
+  const [selectedPresetId, setSelectedPresetId] = useState<string>(DEFAULT_PRESET.id);
+  const [customIsoUrl, setCustomIsoUrl] = useState<string>(DEFAULT_PRESET.url);
+  const [localFileName, setLocalFileName] = useState<string | null>(null);
+  const [bootDevice, setBootDevice] = useState<BootDevice>(DEFAULT_PRESET.device);
+  const [memoryMb, setMemoryMb] = useState<number>(DEFAULT_PRESET.recommendedRamMb);
+  const [activeImageLabel, setActiveImageLabel] = useState<string>(DEFAULT_PRESET.name);
+
+  const [crispScaling, setCrispScaling] = useState(true);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [isPointerLocked, setIsPointerLocked] = useState(false);
-  const [v86Loaded, setV86Loaded] = useState(false);
-  
-  // Track instructions for IPS calculation
-  const lastInstrRef = useRef(0);
-  const lastTimeRef = useRef(0);
+  const [showKeyboard, setShowKeyboard] = useState(false);
+  const [openMenu, setOpenMenu] = useState<'config' | 'state' | null>(null);
+  const [isDragOver, setIsDragOver] = useState(false);
+
+  const [snapshots, setSnapshots] = useState<SavedSnapshotMeta[]>([]);
+  const [isSavingState, setIsSavingState] = useState(false);
+  const [toast, setToast] = useState<ToastMessage | null>(null);
+
+  const showToast = useCallback((text: string, tone: ToastMessage['tone'] = 'info') => {
+    const id = Date.now();
+    setToast({ id, tone, text });
+  }, []);
 
   useEffect(() => {
-    // Dynamically load libv86.js
-    const script = document.createElement('script');
-    script.src = 'https://cdn.jsdelivr.net/npm/v86@latest/build/libv86.js';
-    script.async = true;
-    script.onload = () => setV86Loaded(true);
-    document.body.appendChild(script);
+    if (!toast) return;
+    const timer = window.setTimeout(() => {
+      setToast((current) => (current?.id === toast.id ? null : current));
+    }, 4200);
+    return () => window.clearTimeout(timer);
+  }, [toast]);
+
+  // StrictMode-safe libv86.js script loader
+  useEffect(() => {
+    if (window.V86) {
+      setV86Ready(true);
+      setV86Error(null);
+      return;
+    }
+
+    const scriptId = 'v86-runtime-script';
+    let script = document.getElementById(scriptId) as HTMLScriptElement | null;
+
+    const handleLoad = () => {
+      if (window.V86) {
+        setV86Ready(true);
+        setV86Error(null);
+      } else {
+        setV86Error('v86 runtime loaded, but window.V86 was not initialized.');
+      }
+    };
+
+    const handleError = () => {
+      setV86Error('Unable to load libv86.js from CDN. Check network connectivity or retry.');
+    };
+
+    if (!script) {
+      script = document.createElement('script');
+      script.id = scriptId;
+      script.src = V86_ASSETS.libUrl;
+      script.async = true;
+      script.crossOrigin = 'anonymous';
+      document.head.appendChild(script);
+    }
+
+    script.addEventListener('load', handleLoad);
+    script.addEventListener('error', handleError);
 
     return () => {
-      document.body.removeChild(script);
+      script?.removeEventListener('load', handleLoad);
+      script?.removeEventListener('error', handleError);
+    };
+  }, [scriptAttempt]);
+
+  // Load saved IndexedDB snapshots on mount
+  const refreshSnapshots = useCallback(async () => {
+    try {
+      const list = await listSnapshotsFromDb();
+      setSnapshots(list);
+    } catch {
+      // IndexedDB unavailable in private browsing or restricted iframe
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshSnapshots();
+  }, [refreshSnapshots]);
+
+  // Cleanly destroy VM on unmount
+  useEffect(() => {
+    return () => {
       if (emulatorRef.current) {
-        emulatorRef.current.destroy();
+        void emulatorRef.current.destroy();
+        emulatorRef.current = null;
       }
     };
   }, []);
 
+  // Poll IPS once per second without burning animation frames
   useEffect(() => {
-    // Status polling loop
-    let req: number;
-    const updateStats = () => {
-      if (emulatorRef.current && status === 'running') {
-        const now = Date.now();
-        const instr = emulatorRef.current.get_instruction_counter?.() || 0;
-        const delta = now - lastTimeRef.current;
-        if (delta > 1000) {
-          const ipsVal = (instr - lastInstrRef.current) / (delta / 1000);
-          setIps(Math.max(0, Math.round(ipsVal)));
-          lastTimeRef.current = now;
-          lastInstrRef.current = instr;
+    if (status !== 'running') {
+      setIps(0);
+      return;
+    }
+
+    const interval = window.setInterval(() => {
+      const emu = emulatorRef.current;
+      if (!emu) return;
+
+      const now = performance.now();
+      const instr = emu.get_instruction_counter?.() ?? 0;
+      const elapsedSec = (now - lastTickRef.current) / 1000;
+
+      if (elapsedSec > 0.1) {
+        let deltaInstr = instr - lastInstrRef.current;
+        if (deltaInstr < 0) {
+          // Handle unsigned 32-bit counter wrap-around
+          deltaInstr += 0x100000000;
         }
+        setIps(Math.max(0, Math.round(deltaInstr / elapsedSec)));
+        lastInstrRef.current = instr;
+        lastTickRef.current = now;
       }
-      req = requestAnimationFrame(updateStats);
-    };
-    req = requestAnimationFrame(updateStats);
-    return () => cancelAnimationFrame(req);
+    }, 1000);
+
+    return () => window.clearInterval(interval);
   }, [status]);
 
+  // Fullscreen & Pointer Lock browser listeners
   useEffect(() => {
+    const doc = document as SafariDocument;
     const handleFullscreenChange = () => {
-      setIsFullscreen(!!document.fullscreenElement);
+      setIsFullscreen(Boolean(doc.fullscreenElement || doc.webkitFullscreenElement));
     };
     const handlePointerLockChange = () => {
-      setIsPointerLocked(!!document.pointerLockElement);
+      setIsPointerLocked(Boolean(document.pointerLockElement));
     };
 
     document.addEventListener('fullscreenchange', handleFullscreenChange);
+    document.addEventListener('webkitfullscreenchange', handleFullscreenChange);
     document.addEventListener('pointerlockchange', handlePointerLockChange);
     return () => {
       document.removeEventListener('fullscreenchange', handleFullscreenChange);
+      document.removeEventListener('webkitfullscreenchange', handleFullscreenChange);
       document.removeEventListener('pointerlockchange', handlePointerLockChange);
     };
   }, []);
 
-  const initEmulator = (config: any) => {
-    if (!window.V86) return;
-    if (emulatorRef.current) {
-      emulatorRef.current.destroy();
-    }
+  const resetScreenContainerDom = useCallback(() => {
+    const container = screenRef.current;
+    if (!container) return;
+    container.innerHTML = '';
+    const textLayer = document.createElement('div');
+    const canvasLayer = document.createElement('canvas');
+    canvasLayer.style.display = 'none';
+    container.appendChild(textLayer);
+    container.appendChild(canvasLayer);
+  }, []);
 
-    setStatus('running');
-    lastTimeRef.current = Date.now();
-    lastInstrRef.current = 0;
-    setIps(0);
-
-    const emulator = new window.V86({
-      wasm_path: 'https://cdn.jsdelivr.net/npm/v86@latest/build/v86.wasm',
-      memory_size: 256 * 1024 * 1024,
-      vga_memory_size: 8 * 1024 * 1024,
-      screen_container: screenRef.current,
-      bios: { url: 'https://cdn.jsdelivr.net/npm/v86@latest/bios/seabios.bin' },
-      vga_bios: { url: 'https://cdn.jsdelivr.net/npm/v86@latest/bios/vgabios.bin' },
-      autostart: true,
-      ...config
-    });
-
-    emulatorRef.current = emulator;
-
-    emulator.add_listener('emulator-stopped', () => setStatus('stopped'));
-    emulator.add_listener('emulator-started', () => setStatus('running'));
-    emulator.add_listener('download-error', () => {
-      setStatus('error');
-      alert('Failed to download resources. This may be a CORS issue if using a remote URL. Please use the "Upload ISO" feature instead.');
-    });
-  };
-
-  const startEmulator = () => {
-    initEmulator({ cdrom: { url: isoUrl } });
-  };
-
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) {
-      initEmulator({ cdrom: { buffer: file } });
-    }
-    // reset
-    if (fileInputRef.current) fileInputRef.current.value = '';
-  };
-
-  const saveState = async () => {
-    if (!emulatorRef.current) return;
-    const state = await emulatorRef.current.save_state();
-    const blob = new Blob([state], { type: 'application/octet-stream' });
-    const url = window.URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'v86-state.bin';
-    a.click();
-    window.URL.revokeObjectURL(url);
-  };
-
-  const restoreState = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) {
-      const reader = new FileReader();
-      reader.onload = async (e) => {
-        const buffer = e.target?.result as ArrayBuffer;
-        if (emulatorRef.current) {
-          emulatorRef.current.stop();
-          await emulatorRef.current.restore_state(buffer);
-          emulatorRef.current.run();
-          setStatus('running');
-        } else {
-          initEmulator({ initial_state: { buffer: file } });
-        }
-      };
-      reader.readAsArrayBuffer(file);
-    }
-    if (stateInputRef.current) stateInputRef.current.value = '';
-  };
-
-  const toggleFullscreen = () => {
-    if (!document.fullscreenElement) {
-      document.documentElement.requestFullscreen().catch(console.error);
-    } else {
-      document.exitFullscreen();
-    }
-  };
-
-  const togglePointerLock = () => {
-    if (emulatorRef.current) {
-      if (!isPointerLocked) {
-        emulatorRef.current.lock_mouse();
+  const destroyCurrentEmulator = useCallback(async () => {
+    const emu = emulatorRef.current;
+    emulatorRef.current = null;
+    if (emu) {
+      try {
+        await emu.destroy();
+      } catch {
+        // Ignore teardown errors from interrupted boots
       }
-      // exit is handled by the browser via Esc key
+    }
+    resetScreenContainerDom();
+  }, [resetScreenContainerDom]);
+
+  const bootEmulator = useCallback(
+    async (options: {
+      sourceUrl?: string;
+      localFile?: File | null;
+      device: BootDevice;
+      ramMb: number;
+      sizeHint?: number;
+      label: string;
+      initialStateBuffer?: ArrayBuffer;
+    }) => {
+      if (!window.V86 || !screenRef.current) {
+        showToast('v86 engine is still loading.', 'error');
+        return;
+      }
+
+      setOpenMenu(null);
+      setErrorMessage(null);
+      setDownloadProgress(null);
+      setStatus('loading');
+      setIps(0);
+      setActiveImageLabel(options.label);
+
+      await destroyCurrentEmulator();
+
+      if (!screenRef.current) return;
+
+      const config: V86Config = {
+        wasm_path: V86_ASSETS.wasmUrl,
+        memory_size: options.ramMb * 1024 * 1024,
+        vga_memory_size: 16 * 1024 * 1024,
+        screen_container: screenRef.current,
+        bios: { url: V86_ASSETS.biosUrl },
+        vga_bios: { url: V86_ASSETS.vgaBiosUrl },
+        autostart: true,
+        acpi: false,
+        disable_jit: false,
+      };
+
+      if (options.initialStateBuffer) {
+        config.initial_state = { buffer: options.initialStateBuffer };
+      }
+
+      if (options.localFile) {
+        config[options.device] = {
+          buffer: options.localFile,
+          async: false,
+        };
+      } else if (options.sourceUrl) {
+        config[options.device] = {
+          url: options.sourceUrl,
+          size: options.sizeHint,
+          async: false,
+        };
+      }
+
+      // Prioritize chosen boot medium in SeaBIOS boot order
+      if (options.device === 'cdrom') {
+        config.boot_order = 0x123; // CD, Floppy, HD
+      } else if (options.device === 'hda') {
+        config.boot_order = 0x213; // HD, CD, Floppy
+      } else {
+        config.boot_order = 0x312; // Floppy, CD, HD
+      }
+
+      try {
+        const emulator = new window.V86(config);
+        emulatorRef.current = emulator;
+        lastTickRef.current = performance.now();
+        lastInstrRef.current = 0;
+
+        emulator.add_listener('download-progress', (rawEvent: unknown) => {
+          const ev = rawEvent as {
+            file_name?: string;
+            loaded?: number;
+            total?: number;
+            lengthComputable?: boolean;
+          };
+          const loaded = ev.loaded ?? 0;
+          const total = ev.total ?? 0;
+          const fileName = (ev.file_name ?? 'image').split('/').pop() || 'image';
+          const percent =
+            ev.lengthComputable && total > 0
+              ? Math.min(100, Math.round((loaded / total) * 100))
+              : null;
+          setDownloadProgress({ fileName, loaded, total, percent });
+        });
+
+        emulator.add_listener('emulator-ready', () => {
+          setDownloadProgress(null);
+          setStatus('running');
+          lastTickRef.current = performance.now();
+          lastInstrRef.current = emulator.get_instruction_counter?.() ?? 0;
+        });
+
+        emulator.add_listener('emulator-started', () => {
+          setDownloadProgress(null);
+          setStatus('running');
+          lastTickRef.current = performance.now();
+          lastInstrRef.current = emulator.get_instruction_counter?.() ?? 0;
+        });
+
+        emulator.add_listener('emulator-stopped', () => {
+          setStatus((prev) => (prev === 'error' || prev === 'stopped' ? prev : 'paused'));
+        });
+
+        emulator.add_listener('download-error', (rawEvent: unknown) => {
+          const ev = rawEvent as { file_name?: string } | undefined;
+          const failedFile = ev?.file_name ? ` (${ev.file_name})` : '';
+          setDownloadProgress(null);
+          setStatus('error');
+          setErrorMessage(
+            `Failed to download boot image${failedFile}. Remote servers without CORS headers are blocked by browsers. Download the ISO locally and use "Load Local ISO" to boot completely offline.`
+          );
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'Unexpected WebAssembly initialization failure.';
+        setStatus('error');
+        setErrorMessage(message);
+      }
+    },
+    [destroyCurrentEmulator, showToast]
+  );
+
+  const handlePowerOn = useCallback(() => {
+    if (localFileRef.current) {
+      void bootEmulator({
+        localFile: localFileRef.current,
+        device: bootDevice,
+        ramMb: memoryMb,
+        label: localFileRef.current.name,
+      });
+      return;
+    }
+
+    const preset = OS_PRESETS.find((p) => p.id === selectedPresetId && p.url === customIsoUrl.trim());
+    const trimmedUrl = customIsoUrl.trim();
+    if (!trimmedUrl) {
+      showToast('Select a preset, enter a CORS-enabled URL, or load a local ISO file.', 'error');
+      return;
+    }
+
+    void bootEmulator({
+      sourceUrl: trimmedUrl,
+      device: preset ? preset.device : bootDevice,
+      ramMb: memoryMb,
+      sizeHint: preset?.size,
+      label: preset ? preset.name : trimmedUrl.split('/').pop() || 'Custom ISO',
+    });
+  }, [bootDevice, bootEmulator, customIsoUrl, memoryMb, selectedPresetId, showToast]);
+
+  const handleBootPresetNow = useCallback(
+    (preset: OSPreset) => {
+      localFileRef.current = null;
+      setLocalFileName(null);
+      setSelectedPresetId(preset.id);
+      setCustomIsoUrl(preset.url);
+      setBootDevice(preset.device);
+      setMemoryMb(preset.recommendedRamMb);
+      void bootEmulator({
+        sourceUrl: preset.url,
+        device: preset.device,
+        ramMb: preset.recommendedRamMb,
+        sizeHint: preset.size,
+        label: preset.name,
+      });
+    },
+    [bootEmulator]
+  );
+
+  const handleSelectPreset = useCallback((preset: OSPreset) => {
+    localFileRef.current = null;
+    setLocalFileName(null);
+    setSelectedPresetId(preset.id);
+    setCustomIsoUrl(preset.url);
+    setBootDevice(preset.device);
+    setMemoryMb(preset.recommendedRamMb);
+  }, []);
+
+  const handleUploadIso = useCallback(
+    (file: File) => {
+      localFileRef.current = file;
+      setLocalFileName(file.name);
+      const lower = file.name.toLowerCase();
+      const inferredDevice: BootDevice = lower.endsWith('.iso')
+        ? 'cdrom'
+        : file.size <= 2_949_120
+          ? 'fda'
+          : 'hda';
+      setBootDevice(inferredDevice);
+      void bootEmulator({
+        localFile: file,
+        device: inferredDevice,
+        ramMb: memoryMb,
+        label: file.name,
+      });
+    },
+    [bootEmulator, memoryMb]
+  );
+
+  const handlePowerOff = useCallback(async () => {
+    await destroyCurrentEmulator();
+    setStatus('stopped');
+    setDownloadProgress(null);
+    setErrorMessage(null);
+    setIps(0);
+    showToast('Virtual machine powered off.', 'info');
+  }, [destroyCurrentEmulator, showToast]);
+
+  const handleTogglePause = useCallback(async () => {
+    const emu = emulatorRef.current;
+    if (!emu) return;
+    if (status === 'running') {
+      await emu.stop();
+      setStatus('paused');
+    } else if (status === 'paused') {
+      await emu.run();
+      lastTickRef.current = performance.now();
+      lastInstrRef.current = emu.get_instruction_counter?.() ?? 0;
+      setStatus('running');
+    }
+  }, [status]);
+
+  const handleReset = useCallback(() => {
+    const emu = emulatorRef.current;
+    if (!emu) return;
+    emu.restart();
+    setStatus('running');
+    showToast('System reset signal sent.', 'info');
+  }, [showToast]);
+
+  const handleSaveSnapshotDb = useCallback(async () => {
+    const emu = emulatorRef.current;
+    if (!emu) return;
+    setIsSavingState(true);
+    try {
+      const stateBuffer = await emu.save_state();
+      const now = Date.now();
+      const id = `snap-${now}`;
+      await saveSnapshotToDb({
+        id,
+        name: `${activeImageLabel} · ${new Date(now).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`,
+        presetName: activeImageLabel,
+        memoryMb,
+        byteLength: stateBuffer.byteLength,
+        savedAt: now,
+        data: stateBuffer,
+      });
+      await refreshSnapshots();
+      showToast(`Saved ${formatBytes(stateBuffer.byteLength)} snapshot to browser storage.`, 'success');
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Unable to save machine state.';
+      showToast(msg, 'error');
+    } finally {
+      setIsSavingState(false);
+    }
+  }, [activeImageLabel, memoryMb, refreshSnapshots, showToast]);
+
+  const handleRestoreSnapshotDb = useCallback(
+    async (id: string) => {
+      try {
+        const record = await loadSnapshotFromDb(id);
+        if (!record) {
+          showToast('Snapshot not found in browser storage.', 'error');
+          return;
+        }
+
+        const emu = emulatorRef.current;
+        if (emu && (status === 'running' || status === 'paused')) {
+          await emu.stop();
+          await emu.restore_state(record.data);
+          await emu.run();
+          setStatus('running');
+          setOpenMenu(null);
+          showToast(`Restored "${record.name}".`, 'success');
+        } else {
+          const preset = OS_PRESETS.find((p) => p.id === selectedPresetId);
+          await bootEmulator({
+            localFile: localFileRef.current,
+            sourceUrl: localFileRef.current ? undefined : customIsoUrl.trim() || preset?.url,
+            device: preset ? preset.device : bootDevice,
+            ramMb: record.memoryMb,
+            sizeHint: preset?.size,
+            label: record.presetName,
+            initialStateBuffer: record.data,
+          });
+          showToast(`Booted from snapshot "${record.name}".`, 'success');
+        }
+      } catch (err) {
+        const msg =
+          err instanceof Error
+            ? err.message
+            : 'Snapshot restore failed. Ensure the same OS image and RAM size are active.';
+        showToast(msg, 'error');
+      }
+    },
+    [bootDevice, bootEmulator, customIsoUrl, selectedPresetId, showToast, status]
+  );
+
+  const handleDeleteSnapshotDb = useCallback(
+    async (id: string) => {
+      try {
+        await deleteSnapshotFromDb(id);
+        await refreshSnapshots();
+        showToast('Snapshot deleted.', 'info');
+      } catch {
+        showToast('Could not delete snapshot.', 'error');
+      }
+    },
+    [refreshSnapshots, showToast]
+  );
+
+  const handleDownloadStateFile = useCallback(async () => {
+    const emu = emulatorRef.current;
+    if (!emu) return;
+    setIsSavingState(true);
+    try {
+      const stateBuffer = await emu.save_state();
+      const blob = new Blob([stateBuffer], { type: 'application/octet-stream' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      const slug = activeImageLabel.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+      link.href = url;
+      link.download = `${slug || 'v86'}-state.bin`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+      showToast(`Exported ${formatBytes(stateBuffer.byteLength)} snapshot file.`, 'success');
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Failed to export state file.';
+      showToast(msg, 'error');
+    } finally {
+      setIsSavingState(false);
+    }
+  }, [activeImageLabel, showToast]);
+
+  const handleUploadStateFile = useCallback(
+    async (file: File) => {
+      try {
+        const buffer = await file.arrayBuffer();
+        const emu = emulatorRef.current;
+        if (emu && (status === 'running' || status === 'paused')) {
+          await emu.stop();
+          await emu.restore_state(buffer);
+          await emu.run();
+          setStatus('running');
+          setOpenMenu(null);
+          showToast(`Restored state from ${file.name}.`, 'success');
+        } else {
+          const preset = OS_PRESETS.find((p) => p.id === selectedPresetId);
+          await bootEmulator({
+            localFile: localFileRef.current,
+            sourceUrl: localFileRef.current ? undefined : customIsoUrl.trim() || preset?.url,
+            device: preset ? preset.device : bootDevice,
+            ramMb: memoryMb,
+            sizeHint: preset?.size,
+            label: preset?.name || file.name,
+            initialStateBuffer: buffer,
+          });
+          showToast(`Booted with snapshot ${file.name}.`, 'success');
+        }
+      } catch (err) {
+        const msg =
+          err instanceof Error
+            ? err.message
+            : 'Unable to restore snapshot file. Match the RAM size and OS image used when saving.';
+        showToast(msg, 'error');
+      }
+    },
+    [bootDevice, bootEmulator, customIsoUrl, memoryMb, selectedPresetId, showToast, status]
+  );
+
+  const handleTogglePointerLock = useCallback(() => {
+    const emu = emulatorRef.current;
+    if (!emu) return;
+
+    if (document.pointerLockElement) {
+      document.exitPointerLock?.();
+      return;
+    }
+
+    if (typeof document.documentElement.requestPointerLock !== 'function') {
+      showToast('Pointer lock is unavailable on touch devices. Drag directly on screen to move cursor.', 'info');
+      return;
+    }
+
+    try {
+      emu.lock_mouse();
+    } catch {
+      showToast('Click inside the desktop canvas to capture the mouse pointer.', 'info');
+    }
+  }, [showToast]);
+
+  const handleToggleFullscreen = useCallback(() => {
+    const doc = document as SafariDocument;
+    const root = document.documentElement as SafariElement;
+
+    if (!doc.fullscreenElement && !doc.webkitFullscreenElement) {
+      if (root.requestFullscreen) {
+        root.requestFullscreen().catch(() => {
+          showToast('Fullscreen request was blocked by the browser.', 'info');
+        });
+      } else if (root.webkitRequestFullscreen) {
+        root.webkitRequestFullscreen();
+      } else {
+        showToast('Fullscreen API is not supported in this browser.', 'info');
+      }
+    } else if (doc.exitFullscreen) {
+      doc.exitFullscreen().catch(() => {});
+    } else if (doc.webkitExitFullscreen) {
+      doc.webkitExitFullscreen();
+    }
+  }, [showToast]);
+
+  // Pause v86 global keyboard hooks while typing in UI text fields
+  const handleInputFocusChange = useCallback((focused: boolean) => {
+    emulatorRef.current?.keyboard_set_enabled?.(!focused);
+  }, []);
+
+  const handleSendScancodes = useCallback((codes: number[]) => {
+    emulatorRef.current?.keyboard_send_scancodes?.(codes);
+  }, []);
+
+  const handleSendText = useCallback((text: string) => {
+    emulatorRef.current?.keyboard_send_text?.(text);
+  }, []);
+
+  // Touch-to-mouse emulation for iPadOS Safari / tablets
+  const handleTouchStart = (e: React.TouchEvent<HTMLDivElement>) => {
+    if (status !== 'running' || !emulatorRef.current) return;
+    const touch = e.touches[0];
+    if (!touch) return;
+    touchStateRef.current = {
+      active: true,
+      startX: touch.clientX,
+      startY: touch.clientY,
+      lastX: touch.clientX,
+      lastY: touch.clientY,
+      moved: false,
+      startTime: performance.now(),
+      maxTouches: Math.max(touchStateRef.current.maxTouches, e.touches.length),
+    };
+  };
+
+  const handleTouchMove = (e: React.TouchEvent<HTMLDivElement>) => {
+    const emu = emulatorRef.current;
+    const ts = touchStateRef.current;
+    if (status !== 'running' || !emu || !ts.active) return;
+
+    const touch = e.touches[0];
+    if (!touch) return;
+
+    const dx = touch.clientX - ts.lastX;
+    const dy = touch.clientY - ts.lastY;
+    const totalDist = Math.hypot(touch.clientX - ts.startX, touch.clientY - ts.startY);
+
+    if (totalDist > 6) {
+      ts.moved = true;
+    }
+
+    ts.lastX = touch.clientX;
+    ts.lastY = touch.clientY;
+    ts.maxTouches = Math.max(ts.maxTouches, e.touches.length);
+
+    if (emu.bus && (dx !== 0 || dy !== 0)) {
+      // PS/2 Y axis is inverted relative to screen coordinates
+      emu.bus.send('mouse-delta', [dx * 1.4, -dy * 1.4]);
     }
   };
-  
-  const resetEmulator = () => {
-    if (emulatorRef.current) {
-      emulatorRef.current.restart();
+
+  const handleTouchEnd = (e: React.TouchEvent<HTMLDivElement>) => {
+    const emu = emulatorRef.current;
+    const ts = touchStateRef.current;
+    if (!ts.active) return;
+
+    if (e.touches.length === 0) {
+      const elapsed = performance.now() - ts.startTime;
+      if (status === 'running' && emu?.bus && !ts.moved && elapsed < 300) {
+        if (ts.maxTouches >= 2) {
+          // Two-finger tap -> right click
+          emu.bus.send('mouse-click', [false, false, true]);
+          window.setTimeout(() => emu.bus?.send('mouse-click', [false, false, false]), 45);
+        } else {
+          // Single tap -> left click
+          emu.bus.send('mouse-click', [true, false, false]);
+          window.setTimeout(() => emu.bus?.send('mouse-click', [false, false, false]), 45);
+        }
+      }
+      ts.active = false;
+      ts.maxTouches = 0;
     }
   };
+
+  // Drag & Drop local ISO support directly onto the viewport
+  const handleDragOver = (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    setIsDragOver(true);
+  };
+
+  const handleDragLeave = (e: React.DragEvent<HTMLDivElement>) => {
+    if (e.currentTarget === e.target) {
+      setIsDragOver(false);
+    }
+  };
+
+  const handleDrop = (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    setIsDragOver(false);
+    const file = e.dataTransfer.files?.[0];
+    if (file && /\.(iso|img|bin)$/i.test(file.name)) {
+      handleUploadIso(file);
+    } else if (file) {
+      showToast('Drop a bootable .iso, .img, or .bin disk image.', 'error');
+    }
+  };
+
+  const retryScriptLoad = () => {
+    const existing = document.getElementById('v86-runtime-script');
+    existing?.remove();
+    setV86Error(null);
+    setScriptAttempt((n) => n + 1);
+  };
+
+  const isViewportVisible = status === 'running' || status === 'paused' || status === 'loading';
 
   return (
-    <div className="flex flex-col h-screen bg-zinc-950 text-zinc-300 font-sans overflow-hidden select-none">
-      {/* Toolbar */}
-      <div className="flex flex-wrap items-center justify-between p-3 bg-zinc-900 border-b border-zinc-800 gap-4 relative z-10 shadow-md">
-        
-        {/* Left Side: Controls */}
-        <div className="flex flex-wrap items-center gap-2">
-          {status === 'running' ? (
-            <button onClick={resetEmulator} className="flex items-center gap-2 px-3 py-1.5 bg-red-900/50 hover:bg-red-800 text-red-100 rounded-md transition-colors text-sm font-medium border border-red-800">
-              <RotateCcw size={16} /> Reset
-            </button>
-          ) : (
-            <button onClick={startEmulator} disabled={!v86Loaded} className="flex items-center gap-2 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-md transition-colors text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed">
-              <Power size={16} /> Power On
-            </button>
-          )}
+    <div
+      className="flex flex-col h-dvh w-screen bg-[#090d16] text-slate-200 overflow-hidden select-none"
+      onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
+      onDrop={handleDrop}
+    >
+      <EmulatorToolbar
+        status={status}
+        v86Ready={v86Ready}
+        v86Error={v86Error}
+        ips={ips}
+        memoryMb={memoryMb}
+        selectedPresetId={selectedPresetId}
+        customIsoUrl={customIsoUrl}
+        localFileName={localFileName}
+        bootDevice={bootDevice}
+        crispScaling={crispScaling}
+        isFullscreen={isFullscreen}
+        isPointerLocked={isPointerLocked}
+        showKeyboard={showKeyboard}
+        openMenu={openMenu}
+        snapshots={snapshots}
+        isSavingState={isSavingState}
+        onToggleMenu={(menu) => setOpenMenu((prev) => (prev === menu ? null : menu))}
+        onSelectPreset={handleSelectPreset}
+        onCustomUrlChange={(val) => {
+          localFileRef.current = null;
+          setLocalFileName(null);
+          setCustomIsoUrl(val);
+        }}
+        onBootDeviceChange={setBootDevice}
+        onMemoryChange={setMemoryMb}
+        onToggleCrispScaling={() => setCrispScaling((prev) => !prev)}
+        onPowerOn={handlePowerOn}
+        onPowerOff={() => void handlePowerOff()}
+        onTogglePause={() => void handleTogglePause()}
+        onReset={handleReset}
+        onUploadIso={handleUploadIso}
+        onSaveSnapshotDb={() => void handleSaveSnapshotDb()}
+        onRestoreSnapshotDb={(id) => void handleRestoreSnapshotDb(id)}
+        onDeleteSnapshotDb={(id) => void handleDeleteSnapshotDb(id)}
+        onDownloadStateFile={() => void handleDownloadStateFile()}
+        onUploadStateFile={(file) => void handleUploadStateFile(file)}
+        onTogglePointerLock={handleTogglePointerLock}
+        onToggleFullscreen={handleToggleFullscreen}
+        onToggleKeyboard={() => setShowKeyboard((prev) => !prev)}
+        onInputFocusChange={handleInputFocusChange}
+      />
 
-          <div className="h-6 w-px bg-zinc-700 mx-1"></div>
+      {/* Always-mounted hidden file input for idle & error states */}
+      <input
+        ref={fileDropInputRef}
+        type="file"
+        accept=".iso,.img,.bin"
+        onChange={(e) => {
+          const file = e.target.files?.[0];
+          if (file) handleUploadIso(file);
+          if (fileDropInputRef.current) fileDropInputRef.current.value = '';
+        }}
+        className="hidden"
+      />
 
-          <div className="flex items-center border border-zinc-700 rounded-md overflow-hidden focus-within:border-zinc-500 transition-colors">
-            <input 
-              type="text" 
-              value={isoUrl} 
-              onChange={(e) => setIsoUrl(e.target.value)} 
-              placeholder="ISO URL" 
-              className="bg-zinc-800 text-zinc-200 px-3 py-1.5 w-64 text-sm outline-none"
-            />
-          </div>
-          
-          <span className="text-zinc-500 text-sm">or</span>
-
-          <input 
-            type="file" 
-            accept=".iso,.img" 
-            ref={fileInputRef} 
-            onChange={handleFileUpload} 
-            className="hidden" 
-          />
-          <button onClick={() => fileInputRef.current?.click()} className="flex items-center gap-2 px-3 py-1.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-200 rounded-md transition-colors text-sm font-medium border border-zinc-700">
-            <Upload size={16} /> Upload ISO
-          </button>
-
-          <div className="h-6 w-px bg-zinc-700 mx-1"></div>
-
-          <button onClick={saveState} disabled={status !== 'running'} className="flex items-center gap-2 px-3 py-1.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-200 rounded-md transition-colors text-sm font-medium border border-zinc-700 disabled:opacity-50">
-            <Save size={16} /> Save State
-          </button>
-          
-          <input 
-            type="file" 
-            accept=".bin" 
-            ref={stateInputRef} 
-            onChange={restoreState} 
-            className="hidden" 
-          />
-          <button onClick={() => stateInputRef.current?.click()} disabled={!v86Loaded} className="flex items-center gap-2 px-3 py-1.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-200 rounded-md transition-colors text-sm font-medium border border-zinc-700 disabled:opacity-50">
-            <Upload size={16} /> Restore
-          </button>
-        </div>
-
-        {/* Right Side: Tools & Stats */}
-        <div className="flex items-center gap-4">
-          
-          {/* Stats display */}
-          <div className="flex items-center gap-3 text-xs bg-zinc-950/50 px-3 py-1.5 rounded-md border border-zinc-800">
-            <div className="flex items-center gap-1.5">
-              <div className={`w-2 h-2 rounded-full ${status === 'running' ? 'bg-emerald-500 animate-pulse' : status === 'error' ? 'bg-red-500' : 'bg-zinc-500'}`}></div>
-              <span className="capitalize w-12">{status}</span>
-            </div>
-            <div className="w-px h-3 bg-zinc-700"></div>
-            <div className="w-20">RAM: 256MB</div>
-            <div className="w-px h-3 bg-zinc-700"></div>
-            <div className="w-24 text-right font-mono text-zinc-400">
-              {(ips / 1000000).toFixed(2)} MIPS
-            </div>
-          </div>
-
-          <div className="flex items-center gap-1">
-            <button onClick={() => alert('Virtual keyboard focus requested')} title="Virtual Keyboard" className="p-1.5 hover:bg-zinc-800 text-zinc-400 rounded-md transition-colors hidden md:block">
-              <Keyboard size={18} />
-            </button>
-            <button onClick={togglePointerLock} title="Lock Pointer" className={`p-1.5 rounded-md transition-colors ${isPointerLocked ? 'bg-blue-600 text-white' : 'hover:bg-zinc-800 text-zinc-400'}`}>
-              <MousePointer2 size={18} />
-            </button>
-            <button onClick={toggleFullscreen} title="Fullscreen" className="p-1.5 hover:bg-zinc-800 text-zinc-400 rounded-md transition-colors">
-              <Maximize size={18} />
-            </button>
-          </div>
-        </div>
-      </div>
-
-      {/* Emulator Canvas Container */}
-      <div className="flex-1 relative bg-black flex flex-col items-center justify-center overflow-hidden">
-        
-        {status === 'stopped' && (
-          <div className="absolute inset-0 flex flex-col items-center justify-center z-10 pointer-events-none text-zinc-500">
-            <img src="https://upload.wikimedia.org/wikipedia/commons/3/35/Tux.svg" alt="Linux" className="w-24 h-24 mb-6 opacity-20 grayscale" />
-            <h2 className="text-xl font-medium tracking-tight">System Offline</h2>
-            <p className="text-sm mt-2 max-w-md text-center opacity-70">
-              Power on the machine or upload a bootable disk image to start the emulator. TinyCore Linux will be downloaded if no ISO is provided.
-            </p>
-          </div>
-        )}
-
-        {status === 'error' && (
-          <div className="absolute inset-0 flex flex-col items-center justify-center z-10 pointer-events-none text-red-500">
-            <AlertTriangle className="w-16 h-16 mb-4 opacity-50" />
-            <h2 className="text-xl font-medium tracking-tight">Boot Failed</h2>
-            <p className="text-sm mt-2 max-w-md text-center opacity-70">
-              A network error occurred while fetching the image. This may be due to cross-origin resource sharing (CORS) policies. Please download the ISO manually and use the Upload ISO button.
-            </p>
-          </div>
-        )}
-
-        {/* v86 Screen target */}
-        <div 
-          ref={screenRef} 
-          id="screen_container" 
-          className="relative z-20 shadow-2xl w-full h-full flex items-center justify-center [&>canvas]:max-w-full [&>canvas]:max-h-full [&>canvas]:object-contain"
-          style={{ 
-            display: status === 'stopped' || status === 'error' ? 'none' : 'flex',
-          }}
+      {/* Main Display Viewport */}
+      <main
+        className="flex-1 relative bg-black flex items-center justify-center overflow-hidden min-h-0"
+        onClick={() => {
+          if (openMenu) setOpenMenu(null);
+        }}
+        onTouchStart={handleTouchStart}
+        onTouchMove={handleTouchMove}
+        onTouchEnd={handleTouchEnd}
+      >
+        {/* v86 Screen Target (always mounted so ref is stable) */}
+        <div
+          ref={screenRef}
+          id="screen_container"
+          className={`v86-screen-host ${crispScaling ? 'v86-crisp' : ''}`}
+          style={{ display: isViewportVisible ? 'flex' : 'none' }}
         >
-          <div style={{ whiteSpace: 'pre', font: '14px monospace', lineHeight: '14px', color: '#fff' }}></div>
-          <canvas style={{ display: 'none' }} className="rounded-sm"></canvas>
+          <div />
+          <canvas style={{ display: 'none' }} />
         </div>
 
-      </div>
+        {/* Boot / Image Download Progress Overlay */}
+        {status === 'loading' && (
+          <div className="absolute inset-0 z-20 bg-[#090d16]/90 flex flex-col items-center justify-center px-6">
+            <div className="w-full max-w-md space-y-3">
+              <div className="flex items-center justify-between text-xs">
+                <span className="font-medium text-slate-200 truncate">
+                  Loading {activeImageLabel}
+                </span>
+                <span className="font-mono tabular-nums text-slate-400 shrink-0 ml-2">
+                  {downloadProgress?.percent != null
+                    ? `${downloadProgress.percent}%`
+                    : downloadProgress
+                      ? formatBytes(downloadProgress.loaded)
+                      : 'Initializing WASM'}
+                </span>
+              </div>
+              <div className="h-1.5 w-full bg-slate-800 rounded-full overflow-hidden">
+                <div
+                  className="h-full bg-sky-500 transition-[width] duration-150"
+                  style={{
+                    width:
+                      downloadProgress?.percent != null ? `${downloadProgress.percent}%` : '35%',
+                  }}
+                />
+              </div>
+              <p className="text-[11px] font-mono text-slate-500 truncate">
+                {downloadProgress
+                  ? `Fetching ${downloadProgress.fileName}${downloadProgress.total > 0 ? ` (${formatBytes(downloadProgress.loaded)} / ${formatBytes(downloadProgress.total)})` : ''}`
+                  : 'Allocating x86 memory and SeaBIOS ROM...'}
+              </p>
+            </div>
+          </div>
+        )}
+
+        {/* Paused Overlay Banner */}
+        {status === 'paused' && (
+          <div className="absolute top-4 left-1/2 -translate-x-1/2 z-20 bg-slate-900/95 border border-slate-700 rounded-md px-4 py-2 flex items-center gap-3 shadow-lg">
+            <span className="text-xs font-medium text-amber-300">Execution Paused</span>
+            <button
+              type="button"
+              onClick={() => void handleTogglePause()}
+              className="h-7 px-2.5 rounded bg-sky-600 hover:bg-sky-500 text-white text-xs font-medium flex items-center gap-1"
+            >
+              <Play className="w-3 h-3" />
+              <span>Resume</span>
+            </button>
+          </div>
+        )}
+
+        {/* Idle / Standby Launcher */}
+        {status === 'stopped' && (
+          <div className="absolute inset-0 z-10 overflow-y-auto flex items-center justify-center p-6 bg-[#090d16]">
+            <div className="w-full max-w-3xl space-y-6">
+              <div className="space-y-2">
+                <div className="flex items-center gap-2.5 text-slate-100">
+                  <Monitor className="w-6 h-6 text-sky-400 shrink-0" />
+                  <h1 className="text-xl sm:text-2xl font-semibold tracking-tight">
+                    x86 Desktop Virtual Machine
+                  </h1>
+                </div>
+                <p className="text-sm text-slate-400 max-w-2xl leading-relaxed">
+                  Boot lightweight graphical Linux desktops directly inside your browser&apos;s WebAssembly sandbox. Select a verified X11 distribution below or drop a local Puppy Linux / Tiny Core ISO to run offline.
+                </p>
+              </div>
+
+              {v86Error && (
+                <div className="p-4 rounded-md bg-red-950/50 border border-red-800/80 flex items-center justify-between gap-4">
+                  <div className="flex items-center gap-2.5 text-xs text-red-200">
+                    <AlertTriangle className="w-4 h-4 text-red-400 shrink-0" />
+                    <span>{v86Error}</span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={retryScriptLoad}
+                    className="h-8 px-3 rounded bg-red-900 hover:bg-red-800 text-red-100 text-xs font-medium flex items-center gap-1.5 shrink-0"
+                  >
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    <span>Retry</span>
+                  </button>
+                </div>
+              )}
+
+              {/* Quick-launch OS Grid */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                {OS_PRESETS.map((preset) => (
+                  <button
+                    key={preset.id}
+                    type="button"
+                    disabled={!v86Ready}
+                    onClick={() => handleBootPresetNow(preset)}
+                    className="group text-left p-4 rounded-md bg-slate-900/90 hover:bg-slate-800/90 border border-slate-800 hover:border-sky-500/60 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-sm font-medium text-slate-100 group-hover:text-white">
+                        {preset.name}
+                      </span>
+                      <span className="text-[11px] font-mono text-sky-400 opacity-80 group-hover:opacity-100">
+                        Boot →
+                      </span>
+                    </div>
+                    <p className="text-xs text-slate-400 mt-1">{preset.subtitle}</p>
+                    <div className="text-[11px] font-mono tabular-nums text-slate-500 mt-2.5">
+                      {preset.recommendedRamMb} MB RAM · {preset.device.toUpperCase()} ·{' '}
+                      {preset.graphical ? 'Graphical Desktop' : 'Terminal'}
+                    </div>
+                  </button>
+                ))}
+              </div>
+
+              {/* Local Offline ISO Drop Zone */}
+              <div className="p-4 rounded-md bg-slate-900/50 border border-dashed border-slate-700 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+                <div>
+                  <h2 className="text-xs font-semibold text-slate-200">
+                    Boot Local Puppy Linux or Custom x86 ISO Offline
+                  </h2>
+                  <p className="text-xs text-slate-400 mt-1">
+                    Drag and drop any <span className="font-mono text-slate-300">.iso</span> or{' '}
+                    <span className="font-mono text-slate-300">.img</span> file anywhere on this window, or choose one from device storage.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  disabled={!v86Ready}
+                  onClick={() => fileDropInputRef.current?.click()}
+                  className="h-9 px-4 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-100 text-xs font-medium border border-slate-700 flex items-center gap-2 whitespace-nowrap shrink-0 disabled:opacity-40"
+                >
+                  <HardDriveUpload className="w-3.5 h-3.5 text-sky-400" />
+                  <span>Choose Local ISO</span>
+                </button>
+              </div>
+
+              {/* Quiet hardware specs footer line */}
+              <div className="text-[11px] font-mono tabular-nums text-slate-500 flex flex-wrap items-center gap-x-2 gap-y-1">
+                <span>Bochs VGA / SeaBIOS</span>
+                <span aria-hidden="true">·</span>
+                <span>{memoryMb} MB RAM</span>
+                <span aria-hidden="true">·</span>
+                <span>WebAssembly JIT</span>
+                <span aria-hidden="true">·</span>
+                <span>{v86Ready ? 'Engine Ready' : 'Loading v86 Runtime...'}</span>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Boot Error State */}
+        {status === 'error' && (
+          <div className="absolute inset-0 z-20 flex items-center justify-center p-6 bg-[#090d16]">
+            <div className="w-full max-w-lg p-6 rounded-md bg-slate-900 border border-red-900/70 space-y-4">
+              <div className="flex items-center gap-2.5 text-red-400">
+                <AlertTriangle className="w-5 h-5 shrink-0" />
+                <h2 className="text-base font-semibold text-slate-100">Boot Failed</h2>
+              </div>
+              <p className="text-xs text-slate-300 leading-relaxed">
+                {errorMessage ?? 'Unable to initialize the selected image.'}
+              </p>
+              <div className="flex flex-wrap items-center gap-2 pt-1">
+                <button
+                  type="button"
+                  onClick={() => handleBootPresetNow(DEFAULT_PRESET)}
+                  className="h-9 px-3.5 rounded-md bg-sky-600 hover:bg-sky-500 text-white text-xs font-medium"
+                >
+                  Boot Tiny Core Linux (Verified)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => fileDropInputRef.current?.click()}
+                  className="h-9 px-3.5 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium border border-slate-700"
+                >
+                  Load Local ISO
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setStatus('stopped');
+                    setErrorMessage(null);
+                  }}
+                  className="h-9 px-3.5 rounded-md bg-transparent hover:bg-slate-800 text-slate-400 text-xs font-medium"
+                >
+                  Return to Launcher
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Drag-and-drop overlay indicator */}
+        {isDragOver && (
+          <div className="absolute inset-0 z-40 bg-sky-950/80 border-2 border-dashed border-sky-400 flex flex-col items-center justify-center pointer-events-none">
+            <HardDriveUpload className="w-10 h-10 text-sky-300 mb-2" />
+            <p className="text-sm font-medium text-white">Drop ISO or Disk Image to Boot</p>
+          </div>
+        )}
+
+        {/* Non-blocking Toast Feedback */}
+        {toast && (
+          <div
+            role="status"
+            aria-live="polite"
+            className={`absolute bottom-4 right-4 z-40 max-w-sm px-3.5 py-2.5 rounded-md border text-xs flex items-center gap-3 shadow-lg ${
+              toast.tone === 'error'
+                ? 'bg-red-950/95 border-red-800 text-red-100'
+                : toast.tone === 'success'
+                  ? 'bg-emerald-950/95 border-emerald-800 text-emerald-100'
+                  : 'bg-slate-900/95 border-slate-700 text-slate-100'
+            }`}
+          >
+            <span className="leading-snug">{toast.text}</span>
+            <button
+              type="button"
+              onClick={() => setToast(null)}
+              aria-label="Dismiss notification"
+              className="text-current opacity-70 hover:opacity-100 shrink-0"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        )}
+      </main>
+
+      {/* Interactive Virtual Keyboard (Touch / iPadOS + Special Keys) */}
+      <VirtualKeyboard
+        visible={showKeyboard}
+        onClose={() => setShowKeyboard(false)}
+        onSendScancodes={handleSendScancodes}
+        onSendText={handleSendText}
+        onInputFocusChange={handleInputFocusChange}
+      />
     </div>
   );
 }
-
