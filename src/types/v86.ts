@@ -2,15 +2,24 @@ export type EmulatorStatus = 'stopped' | 'loading' | 'running' | 'paused' | 'err
 
 export type BootDevice = 'cdrom' | 'hda' | 'fda';
 
+export type PresetKind = 'disk' | 'bzimage' | 'state-9p';
+
 export interface OSPreset {
   id: string;
   name: string;
   subtitle: string;
+  badgeText?: string;
+  kind: PresetKind;
   url: string;
   size: number;
   device: BootDevice;
   recommendedRamMb: number;
+  recommendedVramMb?: number;
   graphical: boolean;
+  cmdline?: string;
+  filesystemBaseUrl?: string;
+  netDeviceType?: 'virtio' | 'ne2k';
+  bootHint?: string;
 }
 
 export interface DownloadProgress {
@@ -50,11 +59,23 @@ export interface V86Config {
   cdrom?: V86ImageSource;
   hda?: V86ImageSource;
   fda?: V86ImageSource;
+  bzimage?: V86ImageSource;
+  cmdline?: string;
+  filesystem?: {
+    baseurl?: string;
+    basefs?: string | { url: string; size?: number };
+  };
   initial_state?: V86ImageSource;
   boot_order?: number;
   autostart?: boolean;
   acpi?: boolean;
   disable_jit?: boolean;
+  disable_mouse?: boolean;
+  network_relay_url?: string;
+  net_device?: {
+    type?: 'virtio' | 'ne2k';
+    relay_url?: string;
+  };
   preserve_mac_from_state_image?: boolean;
 }
 

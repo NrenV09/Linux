@@ -12,6 +12,7 @@ import type {
   DownloadProgress,
   EmulatorStatus,
   OSPreset,
+  PresetKind,
   SavedSnapshotMeta,
   V86Config,
   V86Instance,
@@ -31,6 +32,7 @@ import {
 } from './lib/snapshotDb';
 import { EmulatorToolbar } from './components/EmulatorToolbar';
 import { VirtualKeyboard } from './components/VirtualKeyboard';
+import { TouchMouseBar } from './components/TouchMouseBar';
 
 interface ToastMessage {
   id: number;
@@ -47,7 +49,16 @@ interface SafariElement extends HTMLElement {
   webkitRequestFullscreen?: () => Promise<void> | void;
 }
 
-const DEFAULT_PRESET = OS_PRESETS[0];
+const DEFAULT_PRESET = OS_PRESETS[0]; // Arch Linux (Full Rolling)
+
+function isCoarseTouchDevice(): boolean {
+  if (typeof window === 'undefined') return false;
+  return (
+    window.matchMedia?.('(pointer: coarse)').matches ||
+    'ontouchstart' in window ||
+    navigator.maxTouchPoints > 0
+  );
+}
 
 export default function App() {
   const viewportRef = useRef<HTMLElement>(null);
@@ -62,7 +73,16 @@ export default function App() {
   const lastInstrRef = useRef(0);
   const lastTickRef = useRef(0);
 
-  // Touch-to-mouse gesture tracking
+  // Unified mouse button state (shared by physical mouse, trackpad, touch drag, and thumb hold button)
+  const mouseButtonsRef = useRef({ left: false, middle: false, right: false });
+  const thumbLeftHeldRef = useRef(false);
+  const pointerPosRef = useRef<{ x: number; y: number; initialized: boolean }>({
+    x: 0,
+    y: 0,
+    initialized: false,
+  });
+
+  // Touch gesture state (tap, double-tap-and-drag, drag+left-click mode, 2-finger right-click & scroll)
   const touchStateRef = useRef<{
     active: boolean;
     startX: number;
@@ -72,6 +92,11 @@ export default function App() {
     moved: boolean;
     startTime: number;
     maxTouches: number;
+    holdingLeftForDrag: boolean;
+    scrollAccumY: number;
+    lastTapTime: number;
+    lastTapX: number;
+    lastTapY: number;
   }>({
     active: false,
     startX: 0,
@@ -81,6 +106,11 @@ export default function App() {
     moved: false,
     startTime: 0,
     maxTouches: 0,
+    holdingLeftForDrag: false,
+    scrollAccumY: 0,
+    lastTapTime: 0,
+    lastTapX: 0,
+    lastTapY: 0,
   });
 
   const [v86Ready, setV86Ready] = useState<boolean>(
@@ -99,9 +129,14 @@ export default function App() {
   const [localFileName, setLocalFileName] = useState<string | null>(null);
   const [bootDevice, setBootDevice] = useState<BootDevice>(DEFAULT_PRESET.device);
   const [memoryMb, setMemoryMb] = useState<number>(DEFAULT_PRESET.recommendedRamMb);
+  const [vramMb, setVramMb] = useState<number>(DEFAULT_PRESET.recommendedVramMb ?? 8);
+  const [networkEnabled, setNetworkEnabled] = useState<boolean>(true);
   const [activeImageLabel, setActiveImageLabel] = useState<string>(DEFAULT_PRESET.name);
 
   const [crispScaling, setCrispScaling] = useState(true);
+  const [dragMode, setDragMode] = useState(false);
+  const [leftButtonHeldUi, setLeftButtonHeldUi] = useState(false);
+  const [showTouchBar, setShowTouchBar] = useState<boolean>(() => isCoarseTouchDevice());
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [isPointerLocked, setIsPointerLocked] = useState(false);
   const [showKeyboard, setShowKeyboard] = useState(false);
@@ -121,9 +156,43 @@ export default function App() {
     if (!toast) return;
     const timer = window.setTimeout(() => {
       setToast((current) => (current?.id === toast.id ? null : current));
-    }, 4200);
+    }, 5000);
     return () => window.clearTimeout(timer);
   }, [toast]);
+
+  // Low-level PS/2 + VMware absolute mouse dispatch helpers
+  const emitMouseButtons = useCallback((left: boolean, middle: boolean, right: boolean) => {
+    const emu = emulatorRef.current;
+    mouseButtonsRef.current = { left, middle, right };
+    emu?.bus?.send('mouse-click', [left, middle, right]);
+  }, []);
+
+  const emitMouseDelta = useCallback((dx: number, dy: number) => {
+    const emu = emulatorRef.current;
+    if (!emu?.bus || (dx === 0 && dy === 0)) return;
+    // PS/2 Y axis is inverted relative to browser screen Y
+    emu.bus.send('mouse-delta', [dx, -dy]);
+  }, []);
+
+  const emitMouseAbsolute = useCallback((clientX: number, clientY: number) => {
+    const emu = emulatorRef.current;
+    const container = screenRef.current;
+    if (!emu?.bus || !container || document.pointerLockElement) return;
+    const canvas = container.querySelector('canvas');
+    const targetEl = canvas && canvas.style.display !== 'none' ? canvas : container;
+    const rect = targetEl.getBoundingClientRect();
+    if (rect.width > 0 && rect.height > 0) {
+      const x = Math.max(0, Math.min(rect.width, clientX - rect.left));
+      const y = Math.max(0, Math.min(rect.height, clientY - rect.top));
+      emu.bus.send('mouse-absolute', [x, y, rect.width, rect.height]);
+    }
+  }, []);
+
+  const emitMouseWheel = useCallback((deltaY: number) => {
+    const emu = emulatorRef.current;
+    if (!emu?.bus || deltaY === 0) return;
+    emu.bus.send('mouse-wheel', [deltaY > 0 ? 1 : -1, 0]);
+  }, []);
 
   // Scale v86 text/canvas output cleanly to fit viewport while preserving aspect ratio
   const fitScreenToViewport = useCallback(() => {
@@ -164,11 +233,56 @@ export default function App() {
     return () => window.removeEventListener('resize', onResize);
   }, [fitScreenToViewport]);
 
-  // Re-fit display when virtual keyboard toggles
   useEffect(() => {
     const id = window.requestAnimationFrame(() => fitScreenToViewport());
     return () => window.cancelAnimationFrame(id);
   }, [showKeyboard, isFullscreen, fitScreenToViewport]);
+
+  // Global document mouse listeners when Desktop Pointer Lock is active
+  useEffect(() => {
+    if (!isPointerLocked || status !== 'running') return;
+
+    const handleLockedMove = (e: MouseEvent) => {
+      if (e.movementX !== 0 || e.movementY !== 0) {
+        emitMouseDelta(e.movementX, e.movementY);
+      }
+    };
+
+    const handleLockedDown = (e: MouseEvent) => {
+      e.preventDefault();
+      const b = { ...mouseButtonsRef.current };
+      if (e.button === 0) b.left = true;
+      else if (e.button === 1) b.middle = true;
+      else if (e.button === 2) b.right = true;
+      emitMouseButtons(b.left, b.middle, b.right);
+    };
+
+    const handleLockedUp = (e: MouseEvent) => {
+      e.preventDefault();
+      const b = { ...mouseButtonsRef.current };
+      if (e.button === 0) b.left = false;
+      else if (e.button === 1) b.middle = false;
+      else if (e.button === 2) b.right = false;
+      emitMouseButtons(b.left, b.middle, b.right);
+    };
+
+    const handleLockedWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      emitMouseWheel(e.deltaY < 0 ? 1 : -1);
+    };
+
+    document.addEventListener('mousemove', handleLockedMove);
+    document.addEventListener('mousedown', handleLockedDown);
+    document.addEventListener('mouseup', handleLockedUp);
+    document.addEventListener('wheel', handleLockedWheel, { passive: false });
+
+    return () => {
+      document.removeEventListener('mousemove', handleLockedMove);
+      document.removeEventListener('mousedown', handleLockedDown);
+      document.removeEventListener('mouseup', handleLockedUp);
+      document.removeEventListener('wheel', handleLockedWheel);
+    };
+  }, [emitMouseButtons, emitMouseDelta, emitMouseWheel, isPointerLocked, status]);
 
   // StrictMode-safe libv86.js script loader
   useEffect(() => {
@@ -212,7 +326,6 @@ export default function App() {
     };
   }, [scriptAttempt]);
 
-  // Load saved IndexedDB snapshots on mount
   const refreshSnapshots = useCallback(async () => {
     try {
       const list = await listSnapshotsFromDb();
@@ -226,7 +339,6 @@ export default function App() {
     refreshSnapshots();
   }, [refreshSnapshots]);
 
-  // Cleanly abort downloads and destroy VM on unmount
   useEffect(() => {
     return () => {
       abortControllerRef.current?.abort();
@@ -266,7 +378,6 @@ export default function App() {
     return () => window.clearInterval(interval);
   }, [status]);
 
-  // Fullscreen & Pointer Lock browser listeners
   useEffect(() => {
     const doc = document as SafariDocument;
     const handleFullscreenChange = () => {
@@ -300,6 +411,9 @@ export default function App() {
   const destroyCurrentEmulator = useCallback(async () => {
     abortControllerRef.current?.abort();
     abortControllerRef.current = null;
+    mouseButtonsRef.current = { left: false, middle: false, right: false };
+    thumbLeftHeldRef.current = false;
+    setLeftButtonHeldUi(false);
 
     const emu = emulatorRef.current;
     emulatorRef.current = null;
@@ -335,12 +449,18 @@ export default function App() {
 
   const bootEmulator = useCallback(
     async (options: {
+      kind: PresetKind;
       sourceUrl?: string;
       localFile?: File | null;
       device: BootDevice;
       ramMb: number;
+      vramMb: number;
       sizeHint?: number;
       label: string;
+      cmdline?: string;
+      filesystemBaseUrl?: string;
+      netDeviceType?: 'virtio' | 'ne2k';
+      bootHint?: string;
       initialStateBuffer?: ArrayBuffer;
     }) => {
       if (!window.V86 || !screenRef.current) {
@@ -369,11 +489,9 @@ export default function App() {
         });
         const { bios, vgaBios } = await loadBiosBuffers(controller.signal);
 
-        let imageBuffer: ArrayBuffer | File | undefined;
-        if (options.localFile) {
-          imageBuffer = options.localFile;
-        } else if (options.sourceUrl) {
-          imageBuffer = await fetchBinaryWithProgress(options.sourceUrl, {
+        let downloadedBuffer: ArrayBuffer | undefined;
+        if (!options.localFile && options.sourceUrl) {
+          downloadedBuffer = await fetchBinaryWithProgress(options.sourceUrl, {
             expectedSize: options.sizeHint,
             signal: controller.signal,
             onProgress: (prog) => setDownloadProgress(prog),
@@ -382,31 +500,67 @@ export default function App() {
 
         if (controller.signal.aborted || !screenRef.current) return;
 
-        // Ensure fresh text/canvas layers exist right before ScreenAdapter attaches
         resetScreenContainerDom();
+
+        // State-9p presets (e.g. Arch Linux) must match the snapshot's exact RAM/VRAM topology
+        const effectiveRamMb = options.kind === 'state-9p' ? 512 : options.ramMb;
+        const effectiveVramMb = options.kind === 'state-9p' ? 8 : options.vramMb;
 
         const config: V86Config = {
           wasm_path: V86_ASSETS.wasmUrl,
-          memory_size: options.ramMb * 1024 * 1024,
-          vga_memory_size: 8 * 1024 * 1024,
+          memory_size: effectiveRamMb * 1024 * 1024,
+          vga_memory_size: effectiveVramMb * 1024 * 1024,
           screen_container: screenRef.current,
           bios: { buffer: bios },
           vga_bios: { buffer: vgaBios },
-          boot_order: BOOT_ORDER[options.device],
           autostart: true,
           acpi: false,
           disable_jit: false,
+          // Disable built-in MouseAdapter so our unified precision Pointer + Touch Drag driver has zero double-events
+          disable_mouse: true,
         };
 
-        if (options.initialStateBuffer) {
-          config.initial_state = { buffer: options.initialStateBuffer };
+        if (networkEnabled) {
+          config.net_device = {
+            type: options.netDeviceType ?? 'ne2k',
+            relay_url: 'fetch',
+          };
+        } else if (options.netDeviceType) {
+          config.net_device = { type: options.netDeviceType };
         }
 
-        if (imageBuffer) {
-          config[options.device] = {
-            buffer: imageBuffer,
-            async: false,
-          };
+        if (options.kind === 'state-9p') {
+          if (options.filesystemBaseUrl) {
+            config.filesystem = { baseurl: options.filesystemBaseUrl };
+          }
+          if (options.initialStateBuffer || downloadedBuffer) {
+            config.initial_state = {
+              buffer: options.initialStateBuffer ?? downloadedBuffer,
+            };
+          }
+          config.preserve_mac_from_state_image = true;
+        } else if (options.kind === 'bzimage') {
+          if (downloadedBuffer) {
+            config.bzimage = { buffer: downloadedBuffer, async: false };
+          }
+          config.cmdline = options.cmdline;
+          config.filesystem = {};
+          if (options.initialStateBuffer) {
+            config.initial_state = { buffer: options.initialStateBuffer };
+          }
+        } else {
+          // Standard ISO / IMG / Floppy boot
+          config.boot_order = BOOT_ORDER[options.device];
+          const diskPayload = options.localFile ?? downloadedBuffer;
+          if (diskPayload) {
+            config[options.device] = {
+              buffer: diskPayload,
+              async: false,
+            };
+          }
+          if (options.initialStateBuffer) {
+            config.initial_state = { buffer: options.initialStateBuffer };
+          }
         }
 
         setDownloadProgress({
@@ -421,12 +575,17 @@ export default function App() {
         lastTickRef.current = performance.now();
         lastInstrRef.current = 0;
 
+        let hintShown = false;
         const markRunning = () => {
           setDownloadProgress(null);
           setStatus('running');
           lastTickRef.current = performance.now();
           lastInstrRef.current = emulator.get_instruction_counter?.() ?? 0;
           window.requestAnimationFrame(() => fitScreenToViewport());
+          if (!hintShown && options.bootHint) {
+            hintShown = true;
+            showToast(options.bootHint, 'info');
+          }
         };
 
         emulator.add_listener('download-progress', (rawEvent: unknown) => {
@@ -486,6 +645,7 @@ export default function App() {
       destroyCurrentEmulator,
       fitScreenToViewport,
       loadBiosBuffers,
+      networkEnabled,
       resetScreenContainerDom,
       showToast,
     ]
@@ -494,29 +654,37 @@ export default function App() {
   const handlePowerOn = useCallback(() => {
     if (localFileRef.current) {
       void bootEmulator({
+        kind: 'disk',
         localFile: localFileRef.current,
         device: bootDevice,
         ramMb: memoryMb,
+        vramMb,
         label: localFileRef.current.name,
       });
       return;
     }
 
-    const preset = OS_PRESETS.find((p) => p.id === selectedPresetId && p.url === customIsoUrl.trim());
     const trimmedUrl = customIsoUrl.trim();
+    const preset = OS_PRESETS.find((p) => p.id === selectedPresetId && p.url === trimmedUrl);
     if (!trimmedUrl) {
-      showToast('Select a preset, enter a CORS-enabled URL, or load a local ISO file.', 'error');
+      showToast('Select a Linux preset, enter a CORS-enabled URL, or load a local ISO.', 'error');
       return;
     }
 
     void bootEmulator({
+      kind: preset ? preset.kind : 'disk',
       sourceUrl: trimmedUrl,
       device: preset ? preset.device : bootDevice,
       ramMb: memoryMb,
+      vramMb,
       sizeHint: preset?.size,
       label: preset ? preset.name : trimmedUrl.split('/').pop() || 'Custom ISO',
+      cmdline: preset?.cmdline,
+      filesystemBaseUrl: preset?.filesystemBaseUrl,
+      netDeviceType: preset?.netDeviceType,
+      bootHint: preset?.bootHint,
     });
-  }, [bootDevice, bootEmulator, customIsoUrl, memoryMb, selectedPresetId, showToast]);
+  }, [bootDevice, bootEmulator, customIsoUrl, memoryMb, selectedPresetId, showToast, vramMb]);
 
   const handleBootPresetNow = useCallback(
     (preset: OSPreset) => {
@@ -526,12 +694,19 @@ export default function App() {
       setCustomIsoUrl(preset.url);
       setBootDevice(preset.device);
       setMemoryMb(preset.recommendedRamMb);
+      setVramMb(preset.recommendedVramMb ?? 8);
       void bootEmulator({
+        kind: preset.kind,
         sourceUrl: preset.url,
         device: preset.device,
         ramMb: preset.recommendedRamMb,
+        vramMb: preset.recommendedVramMb ?? 8,
         sizeHint: preset.size,
         label: preset.name,
+        cmdline: preset.cmdline,
+        filesystemBaseUrl: preset.filesystemBaseUrl,
+        netDeviceType: preset.netDeviceType,
+        bootHint: preset.bootHint,
       });
     },
     [bootEmulator]
@@ -544,6 +719,7 @@ export default function App() {
     setCustomIsoUrl(preset.url);
     setBootDevice(preset.device);
     setMemoryMb(preset.recommendedRamMb);
+    setVramMb(preset.recommendedVramMb ?? 8);
   }, []);
 
   const handleUploadIso = useCallback(
@@ -558,13 +734,15 @@ export default function App() {
           : 'hda';
       setBootDevice(inferredDevice);
       void bootEmulator({
+        kind: 'disk',
         localFile: file,
         device: inferredDevice,
         ramMb: memoryMb,
+        vramMb,
         label: file.name,
       });
     },
-    [bootEmulator, memoryMb]
+    [bootEmulator, memoryMb, vramMb]
   );
 
   const handlePowerOff = useCallback(async () => {
@@ -573,6 +751,7 @@ export default function App() {
     setDownloadProgress(null);
     setErrorMessage(null);
     setIps(0);
+    setDragMode(false);
     showToast('Virtual machine powered off.', 'info');
   }, [destroyCurrentEmulator, showToast]);
 
@@ -646,12 +825,17 @@ export default function App() {
         } else {
           const preset = OS_PRESETS.find((p) => p.id === selectedPresetId);
           await bootEmulator({
+            kind: preset ? preset.kind : 'disk',
             localFile: localFileRef.current,
             sourceUrl: localFileRef.current ? undefined : customIsoUrl.trim() || preset?.url,
             device: preset ? preset.device : bootDevice,
             ramMb: record.memoryMb,
+            vramMb,
             sizeHint: preset?.size,
             label: record.presetName,
+            cmdline: preset?.cmdline,
+            filesystemBaseUrl: preset?.filesystemBaseUrl,
+            netDeviceType: preset?.netDeviceType,
             initialStateBuffer: record.data,
           });
           showToast(`Booted from snapshot "${record.name}".`, 'success');
@@ -672,6 +856,7 @@ export default function App() {
       selectedPresetId,
       showToast,
       status,
+      vramMb,
     ]
   );
 
@@ -729,12 +914,17 @@ export default function App() {
         } else {
           const preset = OS_PRESETS.find((p) => p.id === selectedPresetId);
           await bootEmulator({
+            kind: preset ? preset.kind : 'disk',
             localFile: localFileRef.current,
             sourceUrl: localFileRef.current ? undefined : customIsoUrl.trim() || preset?.url,
             device: preset ? preset.device : bootDevice,
             ramMb: memoryMb,
+            vramMb,
             sizeHint: preset?.size,
             label: preset?.name || file.name,
+            cmdline: preset?.cmdline,
+            filesystemBaseUrl: preset?.filesystemBaseUrl,
+            netDeviceType: preset?.netDeviceType,
             initialStateBuffer: buffer,
           });
           showToast(`Booted with snapshot ${file.name}.`, 'success');
@@ -756,27 +946,36 @@ export default function App() {
       selectedPresetId,
       showToast,
       status,
+      vramMb,
     ]
   );
 
   const handleTogglePointerLock = useCallback(() => {
-    const emu = emulatorRef.current;
-    if (!emu) return;
+    const target = screenRef.current;
+    if (!target) return;
 
     if (document.pointerLockElement) {
       document.exitPointerLock?.();
       return;
     }
 
-    if (typeof document.documentElement.requestPointerLock !== 'function') {
-      showToast('Pointer lock is unavailable on touch devices. Drag directly on screen to move cursor.', 'info');
+    if (typeof target.requestPointerLock !== 'function') {
+      showToast(
+        'Pointer lock is unavailable on iPadOS. Use Drag + Click mode or double-tap-and-drag directly on screen.',
+        'info'
+      );
       return;
     }
 
     try {
-      emu.lock_mouse();
+      const result = target.requestPointerLock() as unknown as Promise<void> | undefined;
+      if (result && typeof result.catch === 'function') {
+        result.catch(() => {
+          showToast('Click inside the desktop canvas or use Drag + Click directly.', 'info');
+        });
+      }
     } catch {
-      showToast('Click inside the desktop canvas to capture the mouse pointer.', 'info');
+      showToast('Pointer lock unavailable; unlocked drag + left click is already active.', 'info');
     }
   }, [showToast]);
 
@@ -813,29 +1012,139 @@ export default function App() {
     emulatorRef.current?.keyboard_send_text?.(text);
   }, []);
 
-  // Touch-to-mouse emulation for iPadOS Safari / tablets
-  const handleTouchStart = (e: React.TouchEvent<HTMLDivElement>) => {
+  // --- UNIFIED PRECISION POINTER DRIVER (Desktop Mouse / iPad Magic Keyboard Trackpad / Apple Pencil) ---
+  const handleViewportPointerDown = (e: React.PointerEvent<HTMLElement>) => {
+    if (openMenu) setOpenMenu(null);
     if (status !== 'running' || !emulatorRef.current) return;
-    const touch = e.touches[0];
+    if (e.pointerType === 'touch' || document.pointerLockElement) return;
+
+    e.preventDefault();
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      // Ignore capture errors on synthetic pointers
+    }
+
+    pointerPosRef.current = { x: e.clientX, y: e.clientY, initialized: true };
+    emitMouseAbsolute(e.clientX, e.clientY);
+
+    const next = { ...mouseButtonsRef.current };
+    if (e.button === 0) next.left = true;
+    else if (e.button === 1) next.middle = true;
+    else if (e.button === 2) next.right = true;
+    emitMouseButtons(next.left, next.middle, next.right);
+    window.focus();
+  };
+
+  const handleViewportPointerMove = (e: React.PointerEvent<HTMLElement>) => {
+    if (status !== 'running' || !emulatorRef.current) return;
+    if (e.pointerType === 'touch' || document.pointerLockElement) return;
+
+    // WebKit / iPadOS Chrome often reports movementX === 0 when unlocked; fall back to client delta
+    const prev = pointerPosRef.current;
+    let dx = e.movementX;
+    let dy = e.movementY;
+    if (dx === 0 && dy === 0 && prev.initialized) {
+      dx = e.clientX - prev.x;
+      dy = e.clientY - prev.y;
+    }
+    pointerPosRef.current = { x: e.clientX, y: e.clientY, initialized: true };
+
+    emitMouseDelta(dx, dy);
+    emitMouseAbsolute(e.clientX, e.clientY);
+  };
+
+  const handleViewportPointerUp = (e: React.PointerEvent<HTMLElement>) => {
+    if (status !== 'running' || !emulatorRef.current) return;
+    if (e.pointerType === 'touch' || document.pointerLockElement) return;
+
+    try {
+      if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+        e.currentTarget.releasePointerCapture(e.pointerId);
+      }
+    } catch {
+      // Ignore release errors
+    }
+
+    const next = { ...mouseButtonsRef.current };
+    if (e.button === 0) next.left = thumbLeftHeldRef.current;
+    else if (e.button === 1) next.middle = false;
+    else if (e.button === 2) next.right = false;
+    emitMouseButtons(next.left, next.middle, next.right);
+  };
+
+  const handleViewportPointerLeave = (e: React.PointerEvent<HTMLElement>) => {
+    if (e.pointerType === 'touch') return;
+    pointerPosRef.current.initialized = false;
+  };
+
+  const handleViewportWheel = (e: React.WheelEvent<HTMLElement>) => {
+    if (status !== 'running' || !emulatorRef.current || document.pointerLockElement) return;
+    e.preventDefault();
+    emitMouseWheel(e.deltaY < 0 ? 1 : -1);
+  };
+
+  const handleViewportContextMenu = (e: React.MouseEvent<HTMLElement>) => {
+    if (status === 'running') {
+      e.preventDefault();
+    }
+  };
+
+  const getViewportTouches = (touches: React.TouchList): React.Touch[] => {
+    const list: React.Touch[] = [];
+    for (let i = 0; i < touches.length; i++) {
+      const t = touches[i];
+      const target = t.target as HTMLElement | null;
+      if (!target?.closest('[data-touch-mouse-bar="true"]')) {
+        list.push(t);
+      }
+    }
+    return list;
+  };
+
+  // --- UNIFIED PRECISION TOUCH DRIVER (iPad Air M3 Touchscreen: Move, Tap, Double-Tap+Drag, Drag+L-Click Mode, 2-Finger R-Click & Scroll) ---
+  const handleTouchStart = (e: React.TouchEvent<HTMLElement>) => {
+    if (status !== 'running' || !emulatorRef.current) return;
+    const vTouches = getViewportTouches(e.touches);
+    const touch = vTouches[0];
     if (!touch) return;
+
+    const now = performance.now();
+    const prev = touchStateRef.current;
+    const isDoubleTapHold =
+      vTouches.length === 1 &&
+      !thumbLeftHeldRef.current &&
+      now - prev.lastTapTime < 340 &&
+      Math.hypot(touch.clientX - prev.lastTapX, touch.clientY - prev.lastTapY) < 42;
+
+    const engageLeftDrag = vTouches.length === 1 && (dragMode || isDoubleTapHold);
+
     touchStateRef.current = {
+      ...prev,
       active: true,
       startX: touch.clientX,
       startY: touch.clientY,
       lastX: touch.clientX,
       lastY: touch.clientY,
       moved: false,
-      startTime: performance.now(),
-      maxTouches: Math.max(touchStateRef.current.maxTouches, e.touches.length),
+      startTime: now,
+      maxTouches: Math.max(prev.active ? prev.maxTouches : 0, vTouches.length),
+      holdingLeftForDrag: engageLeftDrag,
+      scrollAccumY: 0,
     };
+
+    if (engageLeftDrag) {
+      emitMouseButtons(true, false, false);
+      setLeftButtonHeldUi(true);
+    }
   };
 
-  const handleTouchMove = (e: React.TouchEvent<HTMLDivElement>) => {
-    const emu = emulatorRef.current;
+  const handleTouchMove = (e: React.TouchEvent<HTMLElement>) => {
     const ts = touchStateRef.current;
-    if (status !== 'running' || !emu || !ts.active) return;
+    if (status !== 'running' || !emulatorRef.current || !ts.active) return;
 
-    const touch = e.touches[0];
+    const vTouches = getViewportTouches(e.touches);
+    const touch = vTouches[0];
     if (!touch) return;
 
     const dx = touch.clientX - ts.lastX;
@@ -848,33 +1157,93 @@ export default function App() {
 
     ts.lastX = touch.clientX;
     ts.lastY = touch.clientY;
-    ts.maxTouches = Math.max(ts.maxTouches, e.touches.length);
+    ts.maxTouches = Math.max(ts.maxTouches, vTouches.length);
 
-    if (emu.bus && (dx !== 0 || dy !== 0)) {
-      emu.bus.send('mouse-delta', [dx * 1.4, -dy * 1.4]);
+    if (vTouches.length >= 2) {
+      // Two-finger vertical scroll
+      ts.scrollAccumY += dy;
+      const step = 22;
+      while (Math.abs(ts.scrollAccumY) >= step) {
+        const dir = ts.scrollAccumY > 0 ? 1 : -1;
+        emitMouseWheel(dir);
+        ts.scrollAccumY -= dir * step;
+      }
+      return;
+    }
+
+    if (dx !== 0 || dy !== 0) {
+      const speed = ts.holdingLeftForDrag || thumbLeftHeldRef.current ? 1.15 : 1.4;
+      emitMouseDelta(dx * speed, dy * speed);
     }
   };
 
-  const handleTouchEnd = (e: React.TouchEvent<HTMLDivElement>) => {
-    const emu = emulatorRef.current;
+  const handleTouchEnd = (e: React.TouchEvent<HTMLElement>) => {
     const ts = touchStateRef.current;
     if (!ts.active) return;
 
-    if (e.touches.length === 0) {
-      const elapsed = performance.now() - ts.startTime;
-      if (status === 'running' && emu?.bus && !ts.moved && elapsed < 300) {
+    const remainingViewportTouches = getViewportTouches(e.touches);
+    if (remainingViewportTouches.length === 0) {
+      const now = performance.now();
+      const elapsed = now - ts.startTime;
+
+      if (ts.holdingLeftForDrag) {
+        ts.holdingLeftForDrag = false;
+        emitMouseButtons(thumbLeftHeldRef.current, false, false);
+        setLeftButtonHeldUi(thumbLeftHeldRef.current);
+      } else if (status === 'running' && !ts.moved && elapsed < 300) {
         if (ts.maxTouches >= 2) {
-          emu.bus.send('mouse-click', [false, false, true]);
-          window.setTimeout(() => emu.bus?.send('mouse-click', [false, false, false]), 45);
+          // Two-finger tap -> Right Click
+          emitMouseButtons(false, false, true);
+          window.setTimeout(
+            () => emitMouseButtons(thumbLeftHeldRef.current, false, false),
+            45
+          );
         } else {
-          emu.bus.send('mouse-click', [true, false, false]);
-          window.setTimeout(() => emu.bus?.send('mouse-click', [false, false, false]), 45);
+          // Single tap -> Left Click + remember tap timestamp for double-tap-and-drag
+          ts.lastTapTime = now;
+          ts.lastTapX = ts.startX;
+          ts.lastTapY = ts.startY;
+          emitMouseButtons(true, false, false);
+          window.setTimeout(
+            () => emitMouseButtons(thumbLeftHeldRef.current, false, false),
+            45
+          );
         }
       }
+
       ts.active = false;
       ts.maxTouches = 0;
     }
   };
+
+  const handleTouchCancel = () => {
+    const ts = touchStateRef.current;
+    if (ts.holdingLeftForDrag) {
+      ts.holdingLeftForDrag = false;
+      emitMouseButtons(thumbLeftHeldRef.current, false, false);
+      setLeftButtonHeldUi(thumbLeftHeldRef.current);
+    }
+    ts.active = false;
+    ts.maxTouches = 0;
+  };
+
+  // TouchMouseBar thumb hold handlers
+  const handleThumbLeftDown = useCallback(() => {
+    thumbLeftHeldRef.current = true;
+    setLeftButtonHeldUi(true);
+    emitMouseButtons(true, false, false);
+  }, [emitMouseButtons]);
+
+  const handleThumbLeftUp = useCallback(() => {
+    thumbLeftHeldRef.current = false;
+    setLeftButtonHeldUi(false);
+    emitMouseButtons(false, false, false);
+  }, [emitMouseButtons]);
+
+  const handleTouchRightClick = useCallback(() => {
+    emitMouseButtons(false, false, true);
+    window.setTimeout(() => emitMouseButtons(thumbLeftHeldRef.current, false, false), 45);
+  }, [emitMouseButtons]);
 
   const handleDragOver = (e: React.DragEvent<HTMLDivElement>) => {
     e.preventDefault();
@@ -918,11 +1287,15 @@ export default function App() {
         v86Error={v86Error}
         ips={ips}
         memoryMb={memoryMb}
+        vramMb={vramMb}
+        networkEnabled={networkEnabled}
         selectedPresetId={selectedPresetId}
         customIsoUrl={customIsoUrl}
         localFileName={localFileName}
         bootDevice={bootDevice}
         crispScaling={crispScaling}
+        dragMode={dragMode}
+        showTouchBar={showTouchBar}
         isFullscreen={isFullscreen}
         isPointerLocked={isPointerLocked}
         showKeyboard={showKeyboard}
@@ -938,7 +1311,22 @@ export default function App() {
         }}
         onBootDeviceChange={setBootDevice}
         onMemoryChange={setMemoryMb}
+        onVramChange={setVramMb}
+        onToggleNetwork={() => setNetworkEnabled((prev) => !prev)}
         onToggleCrispScaling={() => setCrispScaling((prev) => !prev)}
+        onToggleDragMode={() => {
+          setDragMode((prev) => {
+            const next = !prev;
+            showToast(
+              next
+                ? 'Drag + Left Click enabled: touch and drag anywhere to move windows or select text.'
+                : 'Normal cursor mode: tap to click, double-tap & hold to drag.',
+              'info'
+            );
+            return next;
+          });
+        }}
+        onToggleTouchBar={() => setShowTouchBar((prev) => !prev)}
         onPowerOn={handlePowerOn}
         onPowerOff={() => void handlePowerOff()}
         onTogglePause={() => void handleTogglePause()}
@@ -971,13 +1359,18 @@ export default function App() {
       {/* Main Display Viewport */}
       <main
         ref={viewportRef}
-        className="flex-1 relative bg-black flex items-center justify-center overflow-hidden min-h-0"
-        onClick={() => {
-          if (openMenu) setOpenMenu(null);
-        }}
+        className="flex-1 relative bg-black flex items-center justify-center overflow-hidden min-h-0 touch-none"
+        onPointerDown={handleViewportPointerDown}
+        onPointerMove={handleViewportPointerMove}
+        onPointerUp={handleViewportPointerUp}
+        onPointerCancel={handleViewportPointerUp}
+        onPointerLeave={handleViewportPointerLeave}
+        onWheel={handleViewportWheel}
+        onContextMenu={handleViewportContextMenu}
         onTouchStart={handleTouchStart}
         onTouchMove={handleTouchMove}
         onTouchEnd={handleTouchEnd}
+        onTouchCancel={handleTouchCancel}
       >
         {/*
           v86 Screen Target:
@@ -989,6 +1382,21 @@ export default function App() {
           id="screen_container"
           className={`v86-screen-host ${crispScaling ? 'v86-crisp' : ''}`}
         />
+
+        {/* Floating iPad / Touch Mouse + Drag Controls Bar */}
+        {status === 'running' && (
+          <TouchMouseBar
+            visible={showTouchBar}
+            dragMode={dragMode}
+            leftButtonHeld={leftButtonHeldUi}
+            onToggleDragMode={() => setDragMode((prev) => !prev)}
+            onLeftButtonDown={handleThumbLeftDown}
+            onLeftButtonUp={handleThumbLeftUp}
+            onRightClick={handleTouchRightClick}
+            onScroll={emitMouseWheel}
+            onClose={() => setShowTouchBar(false)}
+          />
+        )}
 
         {/* Boot / Image Download Progress Overlay */}
         {status === 'loading' && (
@@ -1051,7 +1459,7 @@ export default function App() {
                   </h1>
                 </div>
                 <p className="text-sm text-slate-400 max-w-2xl leading-relaxed">
-                  Boot lightweight graphical Linux desktops directly inside your browser&apos;s WebAssembly sandbox. Select a verified X11 distribution below or drop a local Puppy Linux / Tiny Core ISO to run offline.
+                  Run full rolling Arch Linux, modern 2024 SliTaz Openbox X11, Linux 6.8, or local Puppy Linux ISOs inside WebAssembly—tuned for Apple Silicon M3 Chrome with touch drag-and-click, double-tap drag, and up to 1 GB RAM.
                 </p>
               </div>
 
@@ -1086,14 +1494,19 @@ export default function App() {
                       <span className="text-sm font-medium text-slate-100 group-hover:text-white">
                         {preset.name}
                       </span>
-                      <span className="text-[11px] font-mono text-sky-400 opacity-80 group-hover:opacity-100">
-                        Boot →
+                      <span className="text-[11px] font-mono text-sky-400 opacity-90 group-hover:opacity-100 shrink-0">
+                        {preset.badgeText ? `${preset.badgeText} →` : 'Boot →'}
                       </span>
                     </div>
                     <p className="text-xs text-slate-400 mt-1">{preset.subtitle}</p>
                     <div className="text-[11px] font-mono tabular-nums text-slate-500 mt-2.5">
-                      {preset.recommendedRamMb} MB RAM · {preset.device.toUpperCase()} ·{' '}
-                      {preset.graphical ? 'Graphical Desktop' : 'Terminal'}
+                      {preset.recommendedRamMb} MB RAM ·{' '}
+                      {preset.kind === 'state-9p'
+                        ? '9p + Instant State'
+                        : preset.kind === 'bzimage'
+                          ? 'Direct Kernel'
+                          : preset.device.toUpperCase()}{' '}
+                      · {preset.graphical ? 'X11 / GUI' : 'Console'}
                     </div>
                   </button>
                 ))}
@@ -1103,11 +1516,11 @@ export default function App() {
               <div className="p-4 rounded-md bg-slate-900/50 border border-dashed border-slate-700 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
                 <div>
                   <h2 className="text-xs font-semibold text-slate-200">
-                    Boot Local Puppy Linux or Custom x86 ISO Offline
+                    Boot Local Puppy Linux, Alpine, or Custom x86 ISO Offline
                   </h2>
                   <p className="text-xs text-slate-400 mt-1">
-                    Drag and drop any <span className="font-mono text-slate-300">.iso</span> or{' '}
-                    <span className="font-mono text-slate-300">.img</span> file anywhere on this window, or choose one from device storage.
+                    Drop any <span className="font-mono text-slate-300">.iso</span> or{' '}
+                    <span className="font-mono text-slate-300">.img</span> file here (up to 1 GB RAM in Linux &amp; Hardware settings).
                   </p>
                 </div>
                 <button
@@ -1121,13 +1534,15 @@ export default function App() {
                 </button>
               </div>
 
-              {/* Quiet hardware specs footer line */}
+              {/* Quiet hardware & touch gesture specs footer line */}
               <div className="text-[11px] font-mono tabular-nums text-slate-500 flex flex-wrap items-center gap-x-2 gap-y-1">
-                <span>Bochs VGA / SeaBIOS</span>
+                <span>Tap: L-Click</span>
                 <span aria-hidden="true">·</span>
-                <span>{memoryMb} MB RAM</span>
+                <span>Double-Tap &amp; Drag: L-Click + Drag</span>
                 <span aria-hidden="true">·</span>
-                <span>WebAssembly JIT</span>
+                <span>2-Finger Tap: R-Click</span>
+                <span aria-hidden="true">·</span>
+                <span>2-Finger Drag: Scroll</span>
                 <span aria-hidden="true">·</span>
                 <span>{v86Ready ? 'Engine Ready' : 'Loading v86 Runtime...'}</span>
               </div>
@@ -1149,10 +1564,17 @@ export default function App() {
               <div className="flex flex-wrap items-center gap-2 pt-1">
                 <button
                   type="button"
-                  onClick={() => handleBootPresetNow(DEFAULT_PRESET)}
+                  onClick={() => handleBootPresetNow(OS_PRESETS[0])}
                   className="h-9 px-3.5 rounded-md bg-sky-600 hover:bg-sky-500 text-white text-xs font-medium"
                 >
-                  Boot Tiny Core Linux (Verified)
+                  Boot Arch Linux
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleBootPresetNow(OS_PRESETS[1])}
+                  className="h-9 px-3.5 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium border border-slate-700"
+                >
+                  Boot SliTaz 2024 GUI
                 </button>
                 <button
                   type="button"
@@ -1169,7 +1591,7 @@ export default function App() {
                   }}
                   className="h-9 px-3.5 rounded-md bg-transparent hover:bg-slate-800 text-slate-400 text-xs font-medium"
                 >
-                  Return to Launcher
+                  Launcher
                 </button>
               </div>
             </div>
@@ -1189,7 +1611,7 @@ export default function App() {
           <div
             role="status"
             aria-live="polite"
-            className={`absolute bottom-4 right-4 z-40 max-w-sm px-3.5 py-2.5 rounded-md border text-xs flex items-center gap-3 shadow-lg ${
+            className={`absolute top-4 right-4 z-40 max-w-sm px-3.5 py-2.5 rounded-md border text-xs flex items-center gap-3 shadow-lg ${
               toast.tone === 'error'
                 ? 'bg-red-950/95 border-red-800 text-red-100'
                 : toast.tone === 'success'

@@ -16,6 +16,8 @@ import {
   Download,
   Trash2,
   Database,
+  Move,
+  Hand,
 } from 'lucide-react';
 import type {
   BootDevice,
@@ -23,7 +25,7 @@ import type {
   OSPreset,
   SavedSnapshotMeta,
 } from '../types/v86';
-import { OS_PRESETS, RAM_OPTIONS_MB, formatBytes } from '../lib/presets';
+import { OS_PRESETS, RAM_OPTIONS_MB, VRAM_OPTIONS_MB, formatBytes } from '../lib/presets';
 
 interface EmulatorToolbarProps {
   status: EmulatorStatus;
@@ -31,11 +33,15 @@ interface EmulatorToolbarProps {
   v86Error: string | null;
   ips: number;
   memoryMb: number;
+  vramMb: number;
+  networkEnabled: boolean;
   selectedPresetId: string;
   customIsoUrl: string;
   localFileName: string | null;
   bootDevice: BootDevice;
   crispScaling: boolean;
+  dragMode: boolean;
+  showTouchBar: boolean;
   isFullscreen: boolean;
   isPointerLocked: boolean;
   showKeyboard: boolean;
@@ -47,7 +53,11 @@ interface EmulatorToolbarProps {
   onCustomUrlChange: (url: string) => void;
   onBootDeviceChange: (device: BootDevice) => void;
   onMemoryChange: (mb: number) => void;
+  onVramChange: (mb: number) => void;
+  onToggleNetwork: () => void;
   onToggleCrispScaling: () => void;
+  onToggleDragMode: () => void;
+  onToggleTouchBar: () => void;
   onPowerOn: () => void;
   onPowerOff: () => void;
   onTogglePause: () => void;
@@ -78,11 +88,15 @@ export const EmulatorToolbar: React.FC<EmulatorToolbarProps> = ({
   v86Error,
   ips,
   memoryMb,
+  vramMb,
+  networkEnabled,
   selectedPresetId,
   customIsoUrl,
   localFileName,
   bootDevice,
   crispScaling,
+  dragMode,
+  showTouchBar,
   isFullscreen,
   isPointerLocked,
   showKeyboard,
@@ -94,7 +108,11 @@ export const EmulatorToolbar: React.FC<EmulatorToolbarProps> = ({
   onCustomUrlChange,
   onBootDeviceChange,
   onMemoryChange,
+  onVramChange,
+  onToggleNetwork,
   onToggleCrispScaling,
+  onToggleDragMode,
+  onToggleTouchBar,
   onPowerOn,
   onPowerOff,
   onTogglePause,
@@ -136,7 +154,7 @@ export const EmulatorToolbar: React.FC<EmulatorToolbarProps> = ({
       <div className="flex items-center justify-between gap-3 px-3 py-2 overflow-x-auto">
         {/* Left: Primary VM Power & Image Controls */}
         <div className="flex items-center gap-1.5 shrink-0">
-          <span className="text-sm font-semibold tracking-tight text-slate-100 mr-2 whitespace-nowrap hidden lg:inline">
+          <span className="text-sm font-semibold tracking-tight text-slate-100 mr-2 whitespace-nowrap hidden xl:inline">
             Web Desktop Emulator
           </span>
 
@@ -207,11 +225,11 @@ export const EmulatorToolbar: React.FC<EmulatorToolbarProps> = ({
             type="button"
             onClick={() => isoInputRef.current?.click()}
             disabled={!v86Ready}
-            title="Boot a local Puppy Linux, Tiny Core, or x86 ISO/IMG directly offline"
+            title="Boot a local Puppy Linux, Debian, Alpine, or Tiny Core ISO/IMG offline"
             className={`${btnBase} bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700`}
           >
             <HardDriveUpload className="w-3.5 h-3.5 text-sky-400" />
-            <span>Load Local ISO</span>
+            <span>Load ISO</span>
           </button>
 
           {/* Hardware / Image Configuration Drawer Toggle */}
@@ -226,7 +244,7 @@ export const EmulatorToolbar: React.FC<EmulatorToolbarProps> = ({
             }`}
           >
             <SlidersHorizontal className="w-3.5 h-3.5" />
-            <span>Image & Hardware</span>
+            <span>Linux & Hardware</span>
           </button>
 
           {/* State Persistence Drawer Toggle */}
@@ -251,16 +269,16 @@ export const EmulatorToolbar: React.FC<EmulatorToolbarProps> = ({
           </button>
         </div>
 
-        {/* Right: Live Telemetry (Clean unboxed tabular metadata) & Viewport Controls */}
+        {/* Right: Live Telemetry (Clean unboxed tabular metadata) & Mouse/Viewport Controls */}
         <div className="flex items-center gap-3 shrink-0">
-          <div className="hidden md:flex items-center gap-2 text-xs font-mono tabular-nums text-slate-400 whitespace-nowrap">
+          <div className="hidden lg:flex items-center gap-2 text-xs font-mono tabular-nums text-slate-400 whitespace-nowrap">
             <span className={`font-sans font-medium ${statusInfo.colorClass}`}>
               {statusInfo.label}
             </span>
             <span aria-hidden="true" className="text-slate-600">
               ·
             </span>
-            <span>{memoryMb} MB RAM</span>
+            <span>{memoryMb} MB</span>
             <span aria-hidden="true" className="text-slate-600">
               ·
             </span>
@@ -270,6 +288,43 @@ export const EmulatorToolbar: React.FC<EmulatorToolbarProps> = ({
           </div>
 
           <div className="flex items-center gap-1 shrink-0">
+            {/* Drag + Left Click Mode Toggle */}
+            <button
+              type="button"
+              onClick={onToggleDragMode}
+              disabled={status !== 'running'}
+              title={
+                dragMode
+                  ? 'Drag + Left Click Active (touch drag holds left mouse button)'
+                  : 'Enable Drag + Left Click Mode (for moving windows & selecting text)'
+              }
+              aria-pressed={dragMode}
+              className={`${btnBase} border ${
+                dragMode
+                  ? 'bg-amber-600 text-white border-amber-400'
+                  : 'bg-slate-800 hover:bg-slate-700 text-slate-300 border-slate-700'
+              }`}
+            >
+              <Move className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">Drag + Click</span>
+            </button>
+
+            {/* Touch Mouse Controls Bar Toggle */}
+            <button
+              type="button"
+              onClick={onToggleTouchBar}
+              disabled={status !== 'running'}
+              title="Toggle iPad Touch Mouse Bar (Hold L-Click, Drag, R-Click, Scroll)"
+              aria-pressed={showTouchBar}
+              className={`h-9 w-9 rounded-md flex items-center justify-center transition-colors border disabled:opacity-40 disabled:cursor-not-allowed ${
+                showTouchBar
+                  ? 'bg-sky-600 text-white border-sky-500'
+                  : 'bg-slate-800 hover:bg-slate-700 text-slate-300 border-slate-700'
+              }`}
+            >
+              <Hand className="w-4 h-4" />
+            </button>
+
             <button
               type="button"
               onClick={onToggleKeyboard}
@@ -287,7 +342,7 @@ export const EmulatorToolbar: React.FC<EmulatorToolbarProps> = ({
               type="button"
               onClick={onTogglePointerLock}
               disabled={status !== 'running'}
-              title={isPointerLocked ? 'Unlock Pointer (Esc)' : 'Lock Pointer to Guest OS'}
+              title={isPointerLocked ? 'Unlock Pointer (Esc)' : 'Lock Pointer (Desktop)'}
               aria-pressed={isPointerLocked}
               className={`h-9 w-9 rounded-md flex items-center justify-center transition-colors border disabled:opacity-40 disabled:cursor-not-allowed ${
                 isPointerLocked
@@ -315,12 +370,12 @@ export const EmulatorToolbar: React.FC<EmulatorToolbarProps> = ({
 
       {/* Slide-down Image & Hardware Configuration Panel */}
       {openMenu === 'config' && (
-        <div className="border-t border-slate-800 bg-slate-900/98 px-4 py-4">
+        <div className="border-t border-slate-800 bg-slate-900/98 px-4 py-4 max-h-[75dvh] overflow-y-auto">
           <div className="max-w-5xl mx-auto grid grid-cols-1 md:grid-cols-3 gap-6">
             {/* Column 1: Built-in CORS-verified OS Images */}
             <div className="md:col-span-2">
               <h3 className="text-xs font-semibold text-slate-300 mb-2">
-                Bootable OS Presets (CORS Verified)
+                Linux Distributions (Optimized for Apple M3 / WebAssembly)
               </h3>
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                 {OS_PRESETS.map((preset) => {
@@ -336,7 +391,14 @@ export const EmulatorToolbar: React.FC<EmulatorToolbarProps> = ({
                           : 'bg-slate-950/60 border-slate-800 hover:border-slate-700 text-slate-300'
                       }`}
                     >
-                      <div className="text-xs font-medium text-slate-100">{preset.name}</div>
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-xs font-medium text-slate-100">{preset.name}</span>
+                        {preset.badgeText && (
+                          <span className="text-[10px] font-mono text-sky-400 shrink-0">
+                            {preset.badgeText}
+                          </span>
+                        )}
+                      </div>
                       <div className="text-[11px] text-slate-400 mt-0.5">{preset.subtitle}</div>
                     </button>
                   );
@@ -379,10 +441,12 @@ export const EmulatorToolbar: React.FC<EmulatorToolbarProps> = ({
               </div>
             </div>
 
-            {/* Column 2: Memory, Boot Bus & Display Scaling */}
+            {/* Column 2: Memory, VRAM, Boot Bus, Network & Display Scaling */}
             <div className="space-y-4">
               <div>
-                <div className="text-xs font-semibold text-slate-300 mb-2">System Memory (RAM)</div>
+                <div className="text-xs font-semibold text-slate-300 mb-2">
+                  System Memory (RAM)
+                </div>
                 <div className="flex items-center gap-1 p-1 bg-slate-950 rounded-md border border-slate-800">
                   {RAM_OPTIONS_MB.map((mb) => (
                     <button
@@ -395,42 +459,82 @@ export const EmulatorToolbar: React.FC<EmulatorToolbarProps> = ({
                           : 'text-slate-400 hover:text-slate-200'
                       }`}
                     >
-                      {mb} MB
+                      {mb >= 1024 ? '1 GB' : `${mb}`}
                     </button>
                   ))}
                 </div>
                 <p className="text-[11px] text-slate-500 mt-1">
-                  Takes effect on next Power On. 256–512 MB recommended for Puppy/X11.
+                  512 MB–1 GB ideal for M3 iPad Air (Arch state uses fixed 512 MB).
                 </p>
               </div>
 
-              <div>
-                <div className="text-xs font-semibold text-slate-300 mb-2">
-                  Local / Custom Boot Medium
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <div className="text-xs font-semibold text-slate-300 mb-1.5">VGA RAM</div>
+                  <div className="flex items-center gap-1 p-1 bg-slate-950 rounded-md border border-slate-800">
+                    {VRAM_OPTIONS_MB.map((mb) => (
+                      <button
+                        key={mb}
+                        type="button"
+                        onClick={() => onVramChange(mb)}
+                        className={`flex-1 h-7 rounded text-xs font-mono tabular-nums transition-colors ${
+                          vramMb === mb
+                            ? 'bg-slate-700 text-white font-medium'
+                            : 'text-slate-400 hover:text-slate-200'
+                        }`}
+                      >
+                        {mb} MB
+                      </button>
+                    ))}
+                  </div>
                 </div>
-                <div className="flex items-center gap-1 p-1 bg-slate-950 rounded-md border border-slate-800">
-                  {(['cdrom', 'hda', 'fda'] as BootDevice[]).map((dev) => (
-                    <button
-                      key={dev}
-                      type="button"
-                      onClick={() => onBootDeviceChange(dev)}
-                      className={`flex-1 h-7 rounded text-xs font-mono uppercase transition-colors ${
-                        bootDevice === dev
-                          ? 'bg-slate-700 text-white font-medium'
-                          : 'text-slate-400 hover:text-slate-200'
-                      }`}
-                    >
-                      {dev}
-                    </button>
-                  ))}
+
+                <div>
+                  <div className="text-xs font-semibold text-slate-300 mb-1.5">Boot Bus</div>
+                  <div className="flex items-center gap-1 p-1 bg-slate-950 rounded-md border border-slate-800">
+                    {(['cdrom', 'hda', 'fda'] as BootDevice[]).map((dev) => (
+                      <button
+                        key={dev}
+                        type="button"
+                        onClick={() => onBootDeviceChange(dev)}
+                        className={`flex-1 h-7 rounded text-[11px] font-mono uppercase transition-colors ${
+                          bootDevice === dev
+                            ? 'bg-slate-700 text-white font-medium'
+                            : 'text-slate-400 hover:text-slate-200'
+                        }`}
+                      >
+                        {dev}
+                      </button>
+                    ))}
+                  </div>
                 </div>
+              </div>
+
+              <div className="flex items-center justify-between pt-2 border-t border-slate-800">
+                <div>
+                  <div className="text-xs font-medium text-slate-200">Browser Fetch Network</div>
+                  <div className="text-[11px] text-slate-500">
+                    Virtual NIC bridge for Arch/Linux HTTP access
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={networkEnabled}
+                  onClick={onToggleNetwork}
+                  className={`h-6 w-11 rounded-full transition-colors p-0.5 flex items-center shrink-0 ${
+                    networkEnabled ? 'bg-sky-600 justify-end' : 'bg-slate-700 justify-start'
+                  }`}
+                >
+                  <span className="w-5 h-5 rounded-full bg-white block" />
+                </button>
               </div>
 
               <div className="flex items-center justify-between pt-2 border-t border-slate-800">
                 <div>
                   <div className="text-xs font-medium text-slate-200">Crisp Pixel Scaling</div>
                   <div className="text-[11px] text-slate-500">
-                    Prevents blurry X11 text on HiDPI displays
+                    Sharp X11 text on Retina / HiDPI displays
                   </div>
                 </div>
                 <button
@@ -438,7 +542,7 @@ export const EmulatorToolbar: React.FC<EmulatorToolbarProps> = ({
                   role="switch"
                   aria-checked={crispScaling}
                   onClick={onToggleCrispScaling}
-                  className={`h-6 w-11 rounded-full transition-colors p-0.5 flex items-center ${
+                  className={`h-6 w-11 rounded-full transition-colors p-0.5 flex items-center shrink-0 ${
                     crispScaling ? 'bg-sky-600 justify-end' : 'bg-slate-700 justify-start'
                   }`}
                 >
@@ -468,7 +572,7 @@ export const EmulatorToolbar: React.FC<EmulatorToolbarProps> = ({
                 <button
                   type="button"
                   onClick={onSaveSnapshotDb}
-                  disabled={status !== 'running' && status !== 'paused' || isSavingState}
+                  disabled={(status !== 'running' && status !== 'paused') || isSavingState}
                   className={`${btnBase} bg-sky-600 hover:bg-sky-500 text-white`}
                 >
                   <Database className="w-3.5 h-3.5" />
@@ -477,7 +581,7 @@ export const EmulatorToolbar: React.FC<EmulatorToolbarProps> = ({
                 <button
                   type="button"
                   onClick={onDownloadStateFile}
-                  disabled={status !== 'running' && status !== 'paused' || isSavingState}
+                  disabled={(status !== 'running' && status !== 'paused') || isSavingState}
                   className={`${btnBase} bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700`}
                 >
                   <Download className="w-3.5 h-3.5" />
