@@ -2,7 +2,18 @@ export type EmulatorStatus = 'stopped' | 'loading' | 'running' | 'paused' | 'err
 
 export type BootDevice = 'cdrom' | 'hda' | 'fda';
 
-export type PresetKind = 'disk' | 'bzimage' | 'state-9p';
+export type PresetKind = 'disk' | 'bzimage' | 'state-9p' | 'puppy-direct';
+
+export interface PuppyDirectBootParams {
+  vmlinuzFile: File;
+  initrdFile: File;
+  isoFile: File;
+  memoryMb: number;
+  vramMb: number;
+  cmdline: string;
+  netDeviceType: 'ne2k' | 'virtio';
+  networkRelayUrl: string;
+}
 
 export interface OSPreset {
   id: string;
@@ -47,6 +58,8 @@ export interface V86ImageSource {
   buffer?: ArrayBuffer | File;
   size?: number;
   async?: boolean;
+  fixed_chunk_size?: number;
+  use_parts?: boolean;
 }
 
 export interface V86Config {
@@ -60,6 +73,7 @@ export interface V86Config {
   hda?: V86ImageSource;
   fda?: V86ImageSource;
   bzimage?: V86ImageSource;
+  initrd?: V86ImageSource;
   cmdline?: string;
   filesystem?: {
     baseurl?: string;

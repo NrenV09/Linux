@@ -1,0 +1,36 @@
+# Cloudflare Pages / Static CDN _headers for Puppy Linux Wasm hosting
+# Note: GitHub Pages does not natively support custom response headers;
+# v86 single-threaded mode works on GitHub Pages without COOP/COEP.
+# For QEMU-Wasm (SharedArrayBuffer/pthreads) on GitHub Pages, add coi-serviceworker.
+
+/*.wasm
+  Content-Type: application/wasm
+  Cache-Control: public, max-age=31536000, immutable
+  Access-Control-Allow-Origin: *
+
+/puppy/*.iso
+  Content-Type: application/octet-stream
+  Cache-Control: public, max-age=604800
+  Access-Control-Allow-Origin: *
+  Access-Control-Expose-Headers: Content-Length, Content-Range, Accept-Ranges
+
+/puppy/*.sfs
+  Content-Type: application/octet-stream
+  Cache-Control: public, max-age=604800
+  Access-Control-Allow-Origin: *
+
+/puppy/vmlinuz
+  Content-Type: application/octet-stream
+  Cache-Control: public, max-age=604800
+  Access-Control-Allow-Origin: *
+
+/puppy/initrd.gz
+  Content-Type: application/gzip
+  Cache-Control: public, max-age=604800
+  Access-Control-Allow-Origin: *
+
+# Uncomment ONLY when enabling multi-threaded QEMU-Wasm (VoidPup64 / SharedArrayBuffer):
+# /*
+#   Cross-Origin-Opener-Policy: same-origin
+#   Cross-Origin-Embedder-Policy: require-corp
+#   Cross-Origin-Resource-Policy: cross-origin

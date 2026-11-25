@@ -13,6 +13,7 @@ import type {
   EmulatorStatus,
   OSPreset,
   PresetKind,
+  PuppyDirectBootParams,
   SavedSnapshotMeta,
   V86Config,
   V86Instance,
@@ -33,6 +34,7 @@ import {
 import { EmulatorToolbar } from './components/EmulatorToolbar';
 import { VirtualKeyboard } from './components/VirtualKeyboard';
 import { TouchMouseBar } from './components/TouchMouseBar';
+import { PuppySetupModal } from './components/PuppySetupModal';
 
 interface ToastMessage {
   id: number;
@@ -82,7 +84,7 @@ export default function App() {
     initialized: false,
   });
 
-  // Touch gesture state (tap, double-tap-and-drag, drag+left-click mode, 2-finger right-click & scroll)
+  // Touch gesture state (tap, double-tap-and-drag, drag+left-click mode, 550ms long-press & 2-finger right-click, 2-finger scroll)
   const touchStateRef = useRef<{
     active: boolean;
     startX: number;
@@ -93,6 +95,8 @@ export default function App() {
     startTime: number;
     maxTouches: number;
     holdingLeftForDrag: boolean;
+    longPressTimer: number | null;
+    longPressFired: boolean;
     scrollAccumY: number;
     lastTapTime: number;
     lastTapX: number;
@@ -107,6 +111,8 @@ export default function App() {
     startTime: 0,
     maxTouches: 0,
     holdingLeftForDrag: false,
+    longPressTimer: null,
+    longPressFired: false,
     scrollAccumY: 0,
     lastTapTime: 0,
     lastTapX: 0,
@@ -140,6 +146,7 @@ export default function App() {
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [isPointerLocked, setIsPointerLocked] = useState(false);
   const [showKeyboard, setShowKeyboard] = useState(false);
+  const [showPuppyModal, setShowPuppyModal] = useState(false);
   const [openMenu, setOpenMenu] = useState<'config' | 'state' | null>(null);
   const [isDragOver, setIsDragOver] = useState(false);
 
@@ -341,6 +348,10 @@ export default function App() {
 
   useEffect(() => {
     return () => {
+      if (touchStateRef.current.longPressTimer !== null) {
+        window.clearTimeout(touchStateRef.current.longPressTimer);
+        touchStateRef.current.longPressTimer = null;
+      }
       abortControllerRef.current?.abort();
       if (emulatorRef.current) {
         void emulatorRef.current.destroy();
@@ -411,6 +422,10 @@ export default function App() {
   const destroyCurrentEmulator = useCallback(async () => {
     abortControllerRef.current?.abort();
     abortControllerRef.current = null;
+    if (touchStateRef.current.longPressTimer !== null) {
+      window.clearTimeout(touchStateRef.current.longPressTimer);
+      touchStateRef.current.longPressTimer = null;
+    }
     mouseButtonsRef.current = { left: false, middle: false, right: false };
     thumbLeftHeldRef.current = false;
     setLeftButtonHeldUi(false);
@@ -452,6 +467,8 @@ export default function App() {
       kind: PresetKind;
       sourceUrl?: string;
       localFile?: File | null;
+      vmlinuzFile?: File | null;
+      initrdFile?: File | null;
       device: BootDevice;
       ramMb: number;
       vramMb: number;
@@ -460,6 +477,7 @@ export default function App() {
       cmdline?: string;
       filesystemBaseUrl?: string;
       netDeviceType?: 'virtio' | 'ne2k';
+      networkRelayUrl?: string;
       bootHint?: string;
       initialStateBuffer?: ArrayBuffer;
     }) => {
@@ -502,9 +520,16 @@ export default function App() {
 
         resetScreenContainerDom();
 
-        // State-9p presets (e.g. Arch Linux) must match the snapshot's exact RAM/VRAM topology
-        const effectiveRamMb = options.kind === 'state-9p' ? 512 : options.ramMb;
-        const effectiveVramMb = options.kind === 'state-9p' ? 8 : options.vramMb;
+        // State-9p presets (e.g. Arch Linux) must match the snapshot's exact RAM/VRAM topology.
+        // Puppy direct-kernel mode enforces iPadOS WebKit 256-512 MB guardrails.
+        const effectiveRamMb =
+          options.kind === 'state-9p'
+            ? 512
+            : options.kind === 'puppy-direct'
+              ? Math.min(512, Math.max(256, options.ramMb))
+              : options.ramMb;
+        const effectiveVramMb =
+          options.kind === 'state-9p' || options.kind === 'puppy-direct' ? 8 : options.vramMb;
 
         const config: V86Config = {
           wasm_path: V86_ASSETS.wasmUrl,
@@ -520,10 +545,15 @@ export default function App() {
           disable_mouse: true,
         };
 
-        if (networkEnabled) {
+        if (options.kind === 'puppy-direct') {
           config.net_device = {
             type: options.netDeviceType ?? 'ne2k',
-            relay_url: 'fetch',
+            relay_url: options.networkRelayUrl ?? 'fetch',
+          };
+        } else if (networkEnabled) {
+          config.net_device = {
+            type: options.netDeviceType ?? 'ne2k',
+            relay_url: options.networkRelayUrl ?? 'fetch',
           };
         } else if (options.netDeviceType) {
           config.net_device = { type: options.netDeviceType };
@@ -539,6 +569,21 @@ export default function App() {
             };
           }
           config.preserve_mac_from_state_image = true;
+        } else if (options.kind === 'puppy-direct') {
+          // Direct kernel + initrd boot alongside async-streamed CD-ROM ISO (no double-buffering in iPadOS RAM)
+          if (options.vmlinuzFile) {
+            config.bzimage = { buffer: options.vmlinuzFile };
+          }
+          if (options.initrdFile) {
+            config.initrd = { buffer: options.initrdFile };
+          }
+          if (options.localFile) {
+            config.cdrom = { buffer: options.localFile, async: true };
+          }
+          config.cmdline = options.cmdline;
+          if (options.initialStateBuffer) {
+            config.initial_state = { buffer: options.initialStateBuffer };
+          }
         } else if (options.kind === 'bzimage') {
           if (downloadedBuffer) {
             config.bzimage = { buffer: downloadedBuffer, async: false };
@@ -549,13 +594,16 @@ export default function App() {
             config.initial_state = { buffer: options.initialStateBuffer };
           }
         } else {
-          // Standard ISO / IMG / Floppy boot
+          // Standard ISO / IMG / Floppy boot (stream large local files via AsyncFileBuffer to protect iPadOS RAM)
           config.boot_order = BOOT_ORDER[options.device];
           const diskPayload = options.localFile ?? downloadedBuffer;
           if (diskPayload) {
+            const useAsyncFileBuffer = Boolean(
+              options.localFile && options.localFile.size >= 64 * 1024 * 1024
+            );
             config[options.device] = {
               buffer: diskPayload,
-              async: false,
+              async: useAsyncFileBuffer,
             };
           }
           if (options.initialStateBuffer) {
@@ -743,6 +791,33 @@ export default function App() {
       });
     },
     [bootEmulator, memoryMb, vramMb]
+  );
+
+  const handleBootPuppyDirect = useCallback(
+    (params: PuppyDirectBootParams) => {
+      const safeRamMb = Math.min(512, Math.max(256, params.memoryMb));
+      localFileRef.current = params.isoFile;
+      setLocalFileName(params.isoFile.name);
+      setBootDevice('cdrom');
+      setMemoryMb(safeRamMb);
+      setVramMb(params.vramMb);
+      void bootEmulator({
+        kind: 'puppy-direct',
+        localFile: params.isoFile,
+        vmlinuzFile: params.vmlinuzFile,
+        initrdFile: params.initrdFile,
+        device: 'cdrom',
+        ramMb: safeRamMb,
+        vramMb: params.vramMb,
+        label: `Puppy Linux (${params.isoFile.name})`,
+        cmdline: params.cmdline,
+        netDeviceType: params.netDeviceType,
+        networkRelayUrl: params.networkRelayUrl,
+        bootHint:
+          'Puppy Linux direct kernel boot started (pfix=ram,nocopy + async ISO streaming).',
+      });
+    },
+    [bootEmulator]
   );
 
   const handlePowerOff = useCallback(async () => {
@@ -1102,12 +1177,21 @@ export default function App() {
     return list;
   };
 
-  // --- UNIFIED PRECISION TOUCH DRIVER (iPad Air M3 Touchscreen: Move, Tap, Double-Tap+Drag, Drag+L-Click Mode, 2-Finger R-Click & Scroll) ---
+  // --- UNIFIED PRECISION TOUCH DRIVER (iPadOS Touchscreen: Move, Tap, Double-Tap+Drag, Drag+L-Click Mode, 550ms Long-Press & 2-Finger R-Click, 2-Finger Scroll) ---
+  const clearLongPressTimer = () => {
+    if (touchStateRef.current.longPressTimer !== null) {
+      window.clearTimeout(touchStateRef.current.longPressTimer);
+      touchStateRef.current.longPressTimer = null;
+    }
+  };
+
   const handleTouchStart = (e: React.TouchEvent<HTMLElement>) => {
     if (status !== 'running' || !emulatorRef.current) return;
     const vTouches = getViewportTouches(e.touches);
     const touch = vTouches[0];
     if (!touch) return;
+
+    clearLongPressTimer();
 
     const now = performance.now();
     const prev = touchStateRef.current;
@@ -1130,12 +1214,27 @@ export default function App() {
       startTime: now,
       maxTouches: Math.max(prev.active ? prev.maxTouches : 0, vTouches.length),
       holdingLeftForDrag: engageLeftDrag,
+      longPressTimer: null,
+      longPressFired: false,
       scrollAccumY: 0,
     };
 
     if (engageLeftDrag) {
       emitMouseButtons(true, false, false);
       setLeftButtonHeldUi(true);
+    } else if (vTouches.length === 1 && !thumbLeftHeldRef.current) {
+      touchStateRef.current.longPressTimer = window.setTimeout(() => {
+        const ts = touchStateRef.current;
+        if (ts.active && !ts.moved && ts.maxTouches === 1 && !ts.holdingLeftForDrag) {
+          ts.longPressFired = true;
+          ts.longPressTimer = null;
+          emitMouseButtons(false, false, true);
+          window.setTimeout(
+            () => emitMouseButtons(thumbLeftHeldRef.current, false, false),
+            50
+          );
+        }
+      }, 550);
     }
   };
 
@@ -1151,8 +1250,9 @@ export default function App() {
     const dy = touch.clientY - ts.lastY;
     const totalDist = Math.hypot(touch.clientX - ts.startX, touch.clientY - ts.startY);
 
-    if (totalDist > 6) {
-      ts.moved = true;
+    if (totalDist > 6 || vTouches.length >= 2) {
+      if (totalDist > 6) ts.moved = true;
+      clearLongPressTimer();
     }
 
     ts.lastX = touch.clientX;
@@ -1183,6 +1283,7 @@ export default function App() {
 
     const remainingViewportTouches = getViewportTouches(e.touches);
     if (remainingViewportTouches.length === 0) {
+      clearLongPressTimer();
       const now = performance.now();
       const elapsed = now - ts.startTime;
 
@@ -1190,7 +1291,7 @@ export default function App() {
         ts.holdingLeftForDrag = false;
         emitMouseButtons(thumbLeftHeldRef.current, false, false);
         setLeftButtonHeldUi(thumbLeftHeldRef.current);
-      } else if (status === 'running' && !ts.moved && elapsed < 300) {
+      } else if (status === 'running' && !ts.longPressFired && !ts.moved && elapsed < 300) {
         if (ts.maxTouches >= 2) {
           // Two-finger tap -> Right Click
           emitMouseButtons(false, false, true);
@@ -1213,10 +1314,12 @@ export default function App() {
 
       ts.active = false;
       ts.maxTouches = 0;
+      ts.longPressFired = false;
     }
   };
 
   const handleTouchCancel = () => {
+    clearLongPressTimer();
     const ts = touchStateRef.current;
     if (ts.holdingLeftForDrag) {
       ts.holdingLeftForDrag = false;
@@ -1225,6 +1328,7 @@ export default function App() {
     }
     ts.active = false;
     ts.maxTouches = 0;
+    ts.longPressFired = false;
   };
 
   // TouchMouseBar thumb hold handlers
@@ -1340,6 +1444,10 @@ export default function App() {
         onTogglePointerLock={handleTogglePointerLock}
         onToggleFullscreen={handleToggleFullscreen}
         onToggleKeyboard={() => setShowKeyboard((prev) => !prev)}
+        onOpenPuppySetup={() => {
+          setOpenMenu(null);
+          setShowPuppyModal(true);
+        }}
         onInputFocusChange={handleInputFocusChange}
       />
 
@@ -1394,6 +1502,7 @@ export default function App() {
             onLeftButtonUp={handleThumbLeftUp}
             onRightClick={handleTouchRightClick}
             onScroll={emitMouseWheel}
+            onSendScancodes={handleSendScancodes}
             onClose={() => setShowTouchBar(false)}
           />
         )}
@@ -1520,18 +1629,28 @@ export default function App() {
                   </h2>
                   <p className="text-xs text-slate-400 mt-1">
                     Drop any <span className="font-mono text-slate-300">.iso</span> or{' '}
-                    <span className="font-mono text-slate-300">.img</span> file here (up to 1 GB RAM in Linux &amp; Hardware settings).
+                    <span className="font-mono text-slate-300">.img</span> file here, or use Direct Kernel Boot for BookwormPup32 / NoblePup32 with iPadOS 256–512 MB guardrails.
                   </p>
                 </div>
-                <button
-                  type="button"
-                  disabled={!v86Ready}
-                  onClick={() => fileDropInputRef.current?.click()}
-                  className="h-9 px-4 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-100 text-xs font-medium border border-slate-700 flex items-center gap-2 whitespace-nowrap shrink-0 disabled:opacity-40"
-                >
-                  <HardDriveUpload className="w-3.5 h-3.5 text-sky-400" />
-                  <span>Choose Local ISO</span>
-                </button>
+                <div className="flex flex-wrap items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    disabled={!v86Ready}
+                    onClick={() => setShowPuppyModal(true)}
+                    className="h-9 px-3.5 rounded-md bg-sky-600 hover:bg-sky-500 text-white text-xs font-medium flex items-center gap-1.5 whitespace-nowrap shrink-0 disabled:opacity-40"
+                  >
+                    <span>Puppy iPadOS Setup</span>
+                  </button>
+                  <button
+                    type="button"
+                    disabled={!v86Ready}
+                    onClick={() => fileDropInputRef.current?.click()}
+                    className="h-9 px-3.5 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-100 text-xs font-medium border border-slate-700 flex items-center gap-2 whitespace-nowrap shrink-0 disabled:opacity-40"
+                  >
+                    <HardDriveUpload className="w-3.5 h-3.5 text-sky-400" />
+                    <span>Choose Local ISO</span>
+                  </button>
+                </div>
               </div>
 
               {/* Quiet hardware & touch gesture specs footer line */}
@@ -1540,7 +1659,7 @@ export default function App() {
                 <span aria-hidden="true">·</span>
                 <span>Double-Tap &amp; Drag: L-Click + Drag</span>
                 <span aria-hidden="true">·</span>
-                <span>2-Finger Tap: R-Click</span>
+                <span>Long-Press / 2-Finger Tap: R-Click</span>
                 <span aria-hidden="true">·</span>
                 <span>2-Finger Drag: Scroll</span>
                 <span aria-hidden="true">·</span>
@@ -1638,6 +1757,15 @@ export default function App() {
         onClose={() => setShowKeyboard(false)}
         onSendScancodes={handleSendScancodes}
         onSendText={handleSendText}
+        onInputFocusChange={handleInputFocusChange}
+      />
+
+      {/* Puppy Linux iPadOS WebKit Direct-Kernel Boot & Standalone Config Modal */}
+      <PuppySetupModal
+        open={showPuppyModal}
+        v86Ready={v86Ready}
+        onClose={() => setShowPuppyModal(false)}
+        onBootPuppyDirect={handleBootPuppyDirect}
         onInputFocusChange={handleInputFocusChange}
       />
     </div>

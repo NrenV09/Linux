@@ -18,6 +18,7 @@ import {
   Database,
   Move,
   Hand,
+  Cpu,
 } from 'lucide-react';
 import type {
   BootDevice,
@@ -71,6 +72,7 @@ interface EmulatorToolbarProps {
   onTogglePointerLock: () => void;
   onToggleFullscreen: () => void;
   onToggleKeyboard: () => void;
+  onOpenPuppySetup: () => void;
   onInputFocusChange: (focused: boolean) => void;
 }
 
@@ -126,6 +128,7 @@ export const EmulatorToolbar: React.FC<EmulatorToolbarProps> = ({
   onTogglePointerLock,
   onToggleFullscreen,
   onToggleKeyboard,
+  onOpenPuppySetup,
   onInputFocusChange,
 }) => {
   const isoInputRef = useRef<HTMLInputElement>(null);
@@ -230,6 +233,17 @@ export const EmulatorToolbar: React.FC<EmulatorToolbarProps> = ({
           >
             <HardDriveUpload className="w-3.5 h-3.5 text-sky-400" />
             <span>Load ISO</span>
+          </button>
+
+          {/* Puppy Linux iPadOS Direct-Kernel Setup & Standalone Export */}
+          <button
+            type="button"
+            onClick={onOpenPuppySetup}
+            title="Puppy Linux iPadOS WebKit setup (direct vmlinuz + initrd + async ISO, 256-512 MB cap & QEMU-Wasm config)"
+            className={`${btnBase} bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700`}
+          >
+            <Cpu className="w-3.5 h-3.5 text-emerald-400" />
+            <span>Puppy iPadOS</span>
           </button>
 
           {/* Hardware / Image Configuration Drawer Toggle */}

@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
+    />
+    <meta name="referrer" content="no-referrer" />
+    <meta name="theme-color" content="#0b1120" />
+    <title>Puppy Linux WebAssembly (iPadOS WebKit)</title>
+    <style>
+      :root {
+        --bg: #090d16;
+        --panel: #0f172a;
+        --border: #1e293b;
+        --surface: #1e293b;
+        --text: #e2e8f0;
+        --muted: #94a3b8;
+        --accent: #0284c7;
+        --warn: #d97706;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        height: 100dvh;
+        width: 100vw;
+        overflow: hidden;
+        background: var(--bg);
+        color: var(--text);
+        font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+        overscroll-behavior: none;
+        user-select: none;
+        -webkit-user-select: none;
+      }
+      body {
+        display: flex;
+        flex-direction: column;
+      }
+      header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        padding: 8px 12px;
+        background: var(--panel);
+        border-bottom: 1px solid var(--border);
+        overflow-x: auto;
+        flex-shrink: 0;
+      }
+      .group {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        flex-shrink: 0;
+      }
+      button,
+      select,
+      label.btn {
+        height: 36px;
+        padding: 0 11px;
+        border-radius: 6px;
+        border: 1px solid #334155;
+        background: var(--surface);
+        color: var(--text);
+        font-size: 12px;
+        font-weight: 500;
+        cursor: pointer;
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        white-space: nowrap;
+        flex-shrink: 0;
+      }
+      button.primary {
+        background: var(--accent);
+        border-color: #0ea5e9;
+        color: #fff;
+      }
+      button.active {
+        background: var(--warn);
+        border-color: #f59e0b;
+        color: #fff;
+      }
+      button:disabled {
+        opacity: 0.4;
+        cursor: not-allowed;
+      }
+      .telemetry {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-variant-numeric: tabular-nums;
+        font-size: 12px;
+        color: var(--muted);
+        white-space: nowrap;
+      }
+      main {
+        flex: 1;
+        min-height: 0;
+        position: relative;
+        background: #000;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        overflow: hidden;
+        touch-action: none;
+      }
+      #screen_container {
+        width: 100%;
+        height: 100%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        touch-action: none;
+      }
+      #screen_container > div {
+        white-space: pre;
+        font: 15px/15px ui-monospace, SFMono-Regular, Menlo, monospace;
+        color: #e2e8f0;
+        background: #000;
+      }
+      #screen_container > canvas {
+        image-rendering: pixelated;
+        image-rendering: crisp-edges;
+        background: #000;
+        touch-action: none;
+      }
+      .ipad-bar {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        flex-wrap: wrap;
+        gap: 6px;
+        padding: 8px 10px calc(8px + env(safe-area-inset-bottom));
+        background: var(--panel);
+        border-top: 1px solid var(--border);
+        flex-shrink: 0;
+      }
+      .ipad-bar button {
+        min-width: 48px;
+        height: 40px;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      }
+      .hidden-input {
+        position: fixed;
+        opacity: 0;
+        pointer-events: none;
+        width: 1px;
+        height: 1px;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div class="group">
+        <button id="btn-boot" class="primary" type="button">Boot Puppy Linux</button>
+        <button id="btn-reset" type="button" disabled>Reset</button>
+        <select id="ram-select" aria-label="Guest RAM">
+          <option value="256">256 MB RAM</option>
+          <option value="384">384 MB RAM</option>
+          <option value="512" selected>512 MB RAM (iPadOS Cap)</option>
+        </select>
+        <label class="btn" title="Select local vmlinuz, initrd.gz, and puppy .iso together">
+          Local Files
+          <input id="local-files" type="file" multiple accept=".iso,.gz,.img,*" hidden />
+        </label>
+      </div>
+      <div class="group">
+        <span id="status-line" class="telemetry">Idle · 512 MB · 0.00 MIPS</span>
+        <button id="btn-drag" type="button">Drag + L-Click</button>
+        <button id="btn-kbd" type="button">iPad Keyboard</button>
+        <button id="btn-full" type="button">Fullscreen</button>
+      </div>
+    </header>
+
+    <main id="viewport">
+      <div id="screen_container">
+        <div></div>
+        <canvas style="display: none"></canvas>
+      </div>
+    </main>
+
+    <!-- iPadOS Modifier Key & Mouse Control Bar -->
+    <div class="ipad-bar" role="toolbar" aria-label="iPadOS modifier keys and mouse controls">
+      <button type="button" data-mod="ctrl">Ctrl</button>
+      <button type="button" data-mod="alt">Alt</button>
+      <button type="button" data-mod="super">Super</button>
+      <button type="button" data-key="esc">Esc</button>
+      <button type="button" data-key="tab">Tab</button>
+      <button type="button" data-key="enter">Enter</button>
+      <button type="button" id="btn-rclick">R-Click</button>
+      <button type="button" id="btn-save">Save State</button>
+      <label class="btn" style="height: 40px">
+        Restore
+        <input id="restore-file" type="file" accept=".bin" hidden />
+      </label>
+    </div>
+
+    <input
+      id="ipad-kbd-bridge"
+      class="hidden-input"
+      type="text"
+      autocapitalize="none"
+      autocomplete="off"
+      autocorrect="off"
+      spellcheck="false"
+    />
+
+    <script src="https://cdn.jsdelivr.net/npm/v86@latest/build/libv86.js" crossorigin="anonymous"></script>
+    <script type="module" src="./emulator-config.js"></script>
+  </body>
+</html>
