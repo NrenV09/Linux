@@ -77,7 +77,8 @@ export interface SharedHostFile {
 }
 
 export interface V86Config {
-  wasm_path: string;
+  wasm_path?: string;
+  wasm_fn?: (env: WebAssembly.Imports) => Promise<WebAssembly.Exports>;
   memory_size: number;
   vga_memory_size: number;
   screen_container: HTMLElement;
@@ -101,6 +102,7 @@ export interface V86Config {
   acpi?: boolean;
   disable_jit?: boolean;
   disable_mouse?: boolean;
+  disable_speaker?: boolean;
   network_relay_url?: string;
   net_device?: {
     type?: 'virtio' | 'ne2k';
@@ -129,14 +131,30 @@ export interface V86Fs9p {
 export interface V86Instance {
   bus?: V86Bus;
   fs9p?: V86Fs9p;
+  screen_adapter?: {
+    update_graphical?: () => void;
+  };
   v86?: {
+    stopping?: boolean;
+    running?: boolean;
+    idle?: boolean;
+    tick_counter?: number;
+    worker?: Worker | null;
+    bus?: V86Bus;
     cpu?: {
+      main_loop?: () => number;
+      set_jit_config?: (index: number, value: number) => void;
       devices?: {
         cdrom?: {
           buffer?: unknown;
         };
       };
     };
+    do_tick?: () => void;
+    next_tick?: (t: number) => void;
+    yield?: (t: number, tick: number) => void;
+    yield_callback?: (tick: number) => void;
+    unregister_yield?: () => void;
   };
   run: () => Promise<void> | void;
   stop: () => Promise<void> | void;

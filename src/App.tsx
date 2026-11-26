@@ -51,6 +51,14 @@ import {
   buildPuppyCmdline,
   inspectAndExtractPuppyIso,
 } from './lib/isoPuppyExtractor';
+import {
+  attachV86TurboEngine,
+  createCachedWasmFn,
+  getCachedBiosBuffers,
+  prewarmV86Runtime,
+  shouldUseSyncIsoBuffer,
+  type V86TurboController,
+} from './lib/v86Turbo';
 import { EmulatorToolbar } from './components/EmulatorToolbar';
 import { VirtualKeyboard } from './components/VirtualKeyboard';
 import { TouchMouseBar } from './components/TouchMouseBar';
@@ -90,7 +98,7 @@ export default function App() {
   const localFileRef = useRef<File | null>(null);
   const fileDropInputRef = useRef<HTMLInputElement>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
-  const biosCacheRef = useRef<{ bios: ArrayBuffer; vgaBios: ArrayBuffer } | null>(null);
+  const turboControllerRef = useRef<V86TurboController | null>(null);
 
   // Track IPS accurately with 32-bit wrap-around handling
   const lastInstrRef = useRef(0);
@@ -159,6 +167,9 @@ export default function App() {
   const [memoryMb, setMemoryMb] = useState<number>(DEFAULT_PRESET.recommendedRamMb);
   const [vramMb, setVramMb] = useState<number>(DEFAULT_PRESET.recommendedVramMb ?? 8);
   const [networkEnabled, setNetworkEnabled] = useState<boolean>(true);
+  const [turboMode, setTurboMode] = useState<boolean>(true);
+  const turboModeRef = useRef<boolean>(true);
+  const [soundEnabled, setSoundEnabled] = useState<boolean>(false);
   const [netDeviceType, setNetDeviceType] = useState<'ne2k' | 'virtio'>('ne2k');
   const [networkRelayUrl, setNetworkRelayUrl] = useState<string>('fetch');
   const [attachTransferDrive, setAttachTransferDrive] = useState<boolean>(false);
@@ -402,7 +413,13 @@ export default function App() {
 
   useEffect(() => {
     refreshSnapshots();
+    prewarmV86Runtime();
   }, [refreshSnapshots]);
+
+  useEffect(() => {
+    turboModeRef.current = turboMode;
+    turboControllerRef.current?.setEnabled(turboMode);
+  }, [turboMode]);
 
   useEffect(() => {
     return () => {
@@ -411,6 +428,8 @@ export default function App() {
         touchStateRef.current.longPressTimer = null;
       }
       abortControllerRef.current?.abort();
+      turboControllerRef.current?.cleanup();
+      turboControllerRef.current = null;
       if (emulatorRef.current) {
         void emulatorRef.current.destroy();
         emulatorRef.current = null;
@@ -491,6 +510,9 @@ export default function App() {
     vmwareAbsoluteMouseRef.current = false;
     setLeftButtonHeldUi(false);
 
+    turboControllerRef.current?.cleanup();
+    turboControllerRef.current = null;
+
     const emu = emulatorRef.current;
     emulatorRef.current = null;
     if (emu) {
@@ -504,23 +526,7 @@ export default function App() {
   }, [resetScreenContainerDom]);
 
   const loadBiosBuffers = useCallback(async (signal: AbortSignal) => {
-    if (biosCacheRef.current) {
-      return {
-        bios: biosCacheRef.current.bios.slice(0),
-        vgaBios: biosCacheRef.current.vgaBios.slice(0),
-      };
-    }
-
-    const [bios, vgaBios] = await Promise.all([
-      fetchBinaryWithProgress(V86_ASSETS.biosUrl, { signal }),
-      fetchBinaryWithProgress(V86_ASSETS.vgaBiosUrl, { signal }),
-    ]);
-
-    biosCacheRef.current = { bios, vgaBios };
-    return {
-      bios: bios.slice(0),
-      vgaBios: vgaBios.slice(0),
-    };
+    return getCachedBiosBuffers(signal);
   }, []);
 
   const get9pPrefix = useCallback(() => {
@@ -632,9 +638,9 @@ export default function App() {
             effectiveInitrdBuffer = extracted.initrdBuffer;
             effectiveCmdline = effectiveCmdline || buildPuppyCmdline(targetRam);
             effectiveBootHint =
-              targetRam >= 768
-                ? 'Fast Puppy Direct Boot (pfix=ram,copy + RAM ISO): copies SquashFS into RAM once for instant menus/apps.'
-                : 'Puppy Direct Boot (pfix=ram,nocopy + 2 MB ISO cache): increase RAM to 1–2 GB in Linux & Hardware for full RAM speed.';
+              targetRam >= 1024
+                ? 'Fast Puppy Direct Boot (pfix=ram,copy + Turbo Engine): copies SquashFS into RAM once for snappy menus/apps.'
+                : 'Puppy Direct Boot (pfix=ram,nocopy + 64 MB read-ahead cache + Turbo Engine).';
           }
         }
 
@@ -690,6 +696,7 @@ export default function App() {
 
         const config: V86Config = {
           wasm_path: V86_ASSETS.wasmUrl,
+          wasm_fn: createCachedWasmFn(V86_ASSETS.wasmUrl, (prog) => setDownloadProgress(prog)),
           memory_size: effectiveRamMb * 1024 * 1024,
           vga_memory_size: effectiveVramMb * 1024 * 1024,
           screen_container: screenRef.current,
@@ -701,6 +708,8 @@ export default function App() {
           disable_jit: false,
           // Disable built-in MouseAdapter so our unified precision Pointer + Touch Drag driver has zero double-events
           disable_mouse: true,
+          // Disable Web Audio SpeakerAdapter by default to avoid WebKit AudioContext CPU overhead & stalls
+          disable_speaker: !soundEnabled,
         };
 
         // Automatic network configuration on ALL Puppy Linux & local ISOs (ne2k_pci + fetch auto-DHCP by default)
@@ -763,9 +772,8 @@ export default function App() {
             config.initrd = { buffer: options.initrdFile };
           }
           if (options.localFile) {
-            // At >=768 MB RAM on ISOs <=700 MB, load ISO into SyncFileBuffer (async: false) to eliminate async FileReader stalls
-            const syncIsoInRam =
-              effectiveRamMb >= 768 && options.localFile.size <= 700 * 1024 * 1024;
+            // WebKit OOM guard: load full ISO into RAM only when guest RAM + ISO <= 1400 MB; otherwise use 64 MB LRU cache
+            const syncIsoInRam = shouldUseSyncIsoBuffer(effectiveRamMb, options.localFile.size);
             config.cdrom = { buffer: options.localFile, async: !syncIsoInRam };
           }
           config.cmdline = effectiveCmdline || buildPuppyCmdline(effectiveRamMb);
@@ -788,14 +796,12 @@ export default function App() {
             config.initial_state = { buffer: options.initialStateBuffer };
           }
         } else {
-          // Standard ISO / IMG / Floppy boot (use SyncFileBuffer at >=768 MB for <=700 MB ISOs; otherwise 2 MB cached stream)
+          // Standard ISO / IMG / Floppy boot with WebKit OOM memory guard + 64 MB read-ahead cache
           config.boot_order = BOOT_ORDER[options.device];
           const diskPayload = options.localFile ?? downloadedBuffer;
           if (diskPayload) {
             const useAsyncFileBuffer = Boolean(
-              options.localFile &&
-                (options.localFile.size > 700 * 1024 * 1024 ||
-                  (effectiveRamMb < 768 && options.localFile.size >= 128 * 1024 * 1024))
+              options.localFile && !shouldUseSyncIsoBuffer(effectiveRamMb, options.localFile.size)
             );
             config[options.device] = {
               buffer: diskPayload,
@@ -826,6 +832,7 @@ export default function App() {
 
         const emulator = new window.V86(config);
         emulatorRef.current = emulator;
+        turboControllerRef.current = attachV86TurboEngine(emulator, turboModeRef.current);
         lastTickRef.current = performance.now();
         lastInstrRef.current = 0;
 
@@ -843,6 +850,7 @@ export default function App() {
         let synced9pOnce = false;
         const markRunning = (allowSync9p: boolean) => {
           installIsoCache();
+          turboControllerRef.current?.setEnabled(turboModeRef.current);
           setDownloadProgress(null);
           setStatus('running');
           lastTickRef.current = performance.now();
@@ -877,8 +885,11 @@ export default function App() {
           setDownloadProgress({ fileName, loaded, total, percent });
         });
 
-        // Attach 32 MB sliding read-ahead ISO cache as soon as devices.cdrom exists (without mutating UI/9p yet)
-        emulator.add_listener('emulator-ready', () => installIsoCache());
+        // Attach 64 MB sliding read-ahead ISO cache & apply JIT config as soon as Wasm + devices initialize
+        emulator.add_listener('emulator-ready', () => {
+          installIsoCache();
+          turboControllerRef.current?.setEnabled(turboModeRef.current);
+        });
 
         // Wait for emulator-loaded / emulator-started (fires AFTER restore_state and v86.run())
         emulator.add_listener('emulator-loaded', () => markRunning(true));
@@ -934,6 +945,7 @@ export default function App() {
       networkRelayUrl,
       resetScreenContainerDom,
       showToast,
+      soundEnabled,
       syncAllFilesToVm9p,
       webServerEngine,
       webServerPort,
@@ -1815,6 +1827,8 @@ export default function App() {
         memoryMb={memoryMb}
         vramMb={vramMb}
         networkEnabled={networkEnabled}
+        turboMode={turboMode}
+        soundEnabled={soundEnabled}
         selectedPresetId={selectedPresetId}
         customIsoUrl={customIsoUrl}
         localFileName={localFileName}
@@ -1839,6 +1853,19 @@ export default function App() {
         onMemoryChange={setMemoryMb}
         onVramChange={setVramMb}
         onToggleNetwork={() => setNetworkEnabled((prev) => !prev)}
+        onToggleTurboMode={() => {
+          setTurboMode((prev) => {
+            const next = !prev;
+            showToast(
+              next
+                ? 'Turbo Engine enabled: burst CPU scheduler, larger JIT blocks & 30 FPS VGA pacing.'
+                : 'Turbo Engine disabled: standard v86 tick scheduler & full refresh rate.',
+              'info'
+            );
+            return next;
+          });
+        }}
+        onToggleSound={() => setSoundEnabled((prev) => !prev)}
         onToggleCrispScaling={() => setCrispScaling((prev) => !prev)}
         onToggleDragMode={() => {
           setDragMode((prev) => {
@@ -2119,7 +2146,7 @@ export default function App() {
                   onClick={() => handleBootPresetNow(OS_PRESETS[1])}
                   className="h-9 px-3.5 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium border border-slate-700"
                 >
-                  Boot SliTaz 2024 GUI
+                  Boot Tiny Core GUI
                 </button>
                 <button
                   type="button"

@@ -37,6 +37,8 @@ interface EmulatorToolbarProps {
   memoryMb: number;
   vramMb: number;
   networkEnabled: boolean;
+  turboMode: boolean;
+  soundEnabled: boolean;
   selectedPresetId: string;
   customIsoUrl: string;
   localFileName: string | null;
@@ -57,6 +59,8 @@ interface EmulatorToolbarProps {
   onMemoryChange: (mb: number) => void;
   onVramChange: (mb: number) => void;
   onToggleNetwork: () => void;
+  onToggleTurboMode: () => void;
+  onToggleSound: () => void;
   onToggleCrispScaling: () => void;
   onToggleDragMode: () => void;
   onToggleTouchBar: () => void;
@@ -94,6 +98,8 @@ export const EmulatorToolbar: React.FC<EmulatorToolbarProps> = ({
   memoryMb,
   vramMb,
   networkEnabled,
+  turboMode,
+  soundEnabled,
   selectedPresetId,
   customIsoUrl,
   localFileName,
@@ -114,6 +120,8 @@ export const EmulatorToolbar: React.FC<EmulatorToolbarProps> = ({
   onMemoryChange,
   onVramChange,
   onToggleNetwork,
+  onToggleTurboMode,
+  onToggleSound,
   onToggleCrispScaling,
   onToggleDragMode,
   onToggleTouchBar,
@@ -536,6 +544,46 @@ export const EmulatorToolbar: React.FC<EmulatorToolbarProps> = ({
                     ))}
                   </div>
                 </div>
+              </div>
+
+              <div className="flex items-center justify-between pt-2 border-t border-slate-800">
+                <div>
+                  <div className="text-xs font-medium text-slate-200">Turbo Engine</div>
+                  <div className="text-[11px] text-slate-500">
+                    Burst CPU scheduler, larger JIT blocks &amp; 30 FPS VGA pacing
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={turboMode}
+                  onClick={onToggleTurboMode}
+                  className={`h-6 w-11 rounded-full transition-colors p-0.5 flex items-center shrink-0 ${
+                    turboMode ? 'bg-emerald-600 justify-end' : 'bg-slate-700 justify-start'
+                  }`}
+                >
+                  <span className="w-5 h-5 rounded-full bg-white block" />
+                </button>
+              </div>
+
+              <div className="flex items-center justify-between pt-2 border-t border-slate-800">
+                <div>
+                  <div className="text-xs font-medium text-slate-200">Virtual Sound Card</div>
+                  <div className="text-[11px] text-slate-500">
+                    Off by default for faster CPU &amp; WebKit stability (next boot)
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={soundEnabled}
+                  onClick={onToggleSound}
+                  className={`h-6 w-11 rounded-full transition-colors p-0.5 flex items-center shrink-0 ${
+                    soundEnabled ? 'bg-sky-600 justify-end' : 'bg-slate-700 justify-start'
+                  }`}
+                >
+                  <span className="w-5 h-5 rounded-full bg-white block" />
+                </button>
               </div>
 
               <div className="flex items-center justify-between pt-2 border-t border-slate-800">
