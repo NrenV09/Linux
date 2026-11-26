@@ -5,8 +5,10 @@ export type BootDevice = 'cdrom' | 'hda' | 'fda';
 export type PresetKind = 'disk' | 'bzimage' | 'state-9p' | 'puppy-direct';
 
 export interface PuppyDirectBootParams {
-  vmlinuzFile: File;
-  initrdFile: File;
+  vmlinuzFile?: File | null;
+  initrdFile?: File | null;
+  vmlinuzBuffer?: ArrayBuffer;
+  initrdBuffer?: ArrayBuffer;
   isoFile: File;
   memoryMb: number;
   vramMb: number;
@@ -126,6 +128,15 @@ export interface V86Fs9p {
 export interface V86Instance {
   bus?: V86Bus;
   fs9p?: V86Fs9p;
+  v86?: {
+    cpu?: {
+      devices?: {
+        cdrom?: {
+          buffer?: unknown;
+        };
+      };
+    };
+  };
   run: () => Promise<void> | void;
   stop: () => Promise<void> | void;
   destroy: () => Promise<void> | void;

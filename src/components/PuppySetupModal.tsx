@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { X, Play, Copy, Check, Download, HardDriveUpload, ShieldCheck } from 'lucide-react';
 import type { PuppyDirectBootParams } from '../types/v86';
 import { formatBytes } from '../lib/presets';
+import { FAST_PUPPY_CMDLINE, inspectAndExtractPuppyIso } from '../lib/isoPuppyExtractor';
 
 interface PuppySetupModalProps {
   open: boolean;
@@ -11,8 +12,7 @@ interface PuppySetupModalProps {
   onInputFocusChange: (focused: boolean) => void;
 }
 
-const DEFAULT_PUPPY_CMDLINE =
-  'pfix=ram,nocopy pmedia=cd acpi=off noapic nolapic tsc=reliable mitigations=off';
+const DEFAULT_PUPPY_CMDLINE = FAST_PUPPY_CMDLINE;
 
 const DIRECTORY_LAYOUT = `repo-root/
 ├── index.html                  # Standalone v86 iPadOS WebKit entry point
@@ -89,6 +89,13 @@ export const PuppySetupModal: React.FC<PuppySetupModalProps> = ({
   const [tab, setTab] = useState<'boot' | 'layout' | 'config'>('boot');
   const [vmlinuzFile, setVmlinuzFile] = useState<File | null>(null);
   const [initrdFile, setInitrdFile] = useState<File | null>(null);
+  const [extractedBuffers, setExtractedBuffers] = useState<{
+    vmlinuzName: string;
+    vmlinuzBuffer: ArrayBuffer;
+    initrdName: string;
+    initrdBuffer: ArrayBuffer;
+  } | null>(null);
+  const [extractNote, setExtractNote] = useState<string | null>(null);
   const [isoFile, setIsoFile] = useState<File | null>(null);
   const [memoryMb, setMemoryMb] = useState<number>(512);
   const [netDeviceType, setNetDeviceType] = useState<'ne2k' | 'virtio'>('ne2k');
@@ -103,7 +110,9 @@ export const PuppySetupModal: React.FC<PuppySetupModalProps> = ({
     window.crossOriginIsolated === true &&
     typeof SharedArrayBuffer !== 'undefined';
 
-  const canBootDirect = Boolean(v86Ready && vmlinuzFile && initrdFile && isoFile);
+  const hasKernel = Boolean(vmlinuzFile || extractedBuffers?.vmlinuzBuffer);
+  const hasInitrd = Boolean(initrdFile || extractedBuffers?.initrdBuffer);
+  const canBootDirect = Boolean(v86Ready && hasKernel && hasInitrd && isoFile);
 
   const handleCopy = async (key: string, text: string) => {
     try {
@@ -115,22 +124,56 @@ export const PuppySetupModal: React.FC<PuppySetupModalProps> = ({
     }
   };
 
+  const tryAutoExtractFromIso = async (file: File) => {
+    setExtractNote('Scanning ISO for vmlinuz & initrd.gz...');
+    const extracted = await inspectAndExtractPuppyIso(file);
+    if (extracted) {
+      setExtractedBuffers({
+        vmlinuzName: extracted.vmlinuzName,
+        vmlinuzBuffer: extracted.vmlinuzBuffer,
+        initrdName: extracted.initrdName,
+        initrdBuffer: extracted.initrdBuffer,
+      });
+      setExtractNote(
+        `Auto-extracted ${extracted.vmlinuzName} (${formatBytes(extracted.vmlinuzBuffer.byteLength)}) & ${extracted.initrdName} (${formatBytes(extracted.initrdBuffer.byteLength)}) straight from ISO.`
+      );
+    } else {
+      setExtractedBuffers(null);
+      setExtractNote(null);
+    }
+  };
+
   const handleMultiPick = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files ?? []);
+    let pickedIso: File | null = null;
+    let pickedKernel = false;
+    let pickedInitrd = false;
     for (const f of files) {
       const lower = f.name.toLowerCase();
-      if (lower.includes('vmlinuz')) setVmlinuzFile(f);
-      else if (lower.includes('initrd')) setInitrdFile(f);
-      else if (lower.endsWith('.iso') || lower.endsWith('.img')) setIsoFile(f);
+      if (lower.includes('vmlinuz')) {
+        setVmlinuzFile(f);
+        pickedKernel = true;
+      } else if (lower.includes('initrd')) {
+        setInitrdFile(f);
+        pickedInitrd = true;
+      } else if (lower.endsWith('.iso') || lower.endsWith('.img')) {
+        setIsoFile(f);
+        pickedIso = f;
+      }
+    }
+    if (pickedIso && (!pickedKernel || !pickedInitrd)) {
+      void tryAutoExtractFromIso(pickedIso);
     }
     e.target.value = '';
   };
 
   const handleLaunch = () => {
-    if (!vmlinuzFile || !initrdFile || !isoFile) return;
+    if (!canBootDirect || !isoFile) return;
     onBootPuppyDirect({
-      vmlinuzFile,
-      initrdFile,
+      vmlinuzFile: vmlinuzFile ?? null,
+      initrdFile: initrdFile ?? null,
+      vmlinuzBuffer: vmlinuzFile ? undefined : extractedBuffers?.vmlinuzBuffer,
+      initrdBuffer: initrdFile ? undefined : extractedBuffers?.initrdBuffer,
       isoFile,
       memoryMb,
       vramMb: 8,
@@ -228,10 +271,18 @@ export const PuppySetupModal: React.FC<PuppySetupModalProps> = ({
                   <label className="p-3 rounded-md bg-slate-950 border border-slate-800 hover:border-slate-600 cursor-pointer block">
                     <div className="font-mono text-[11px] text-slate-400">Kernel (bzimage)</div>
                     <div className="font-medium text-slate-100 mt-1 truncate">
-                      {vmlinuzFile ? vmlinuzFile.name : 'Select vmlinuz'}
+                      {vmlinuzFile
+                        ? vmlinuzFile.name
+                        : extractedBuffers
+                          ? `${extractedBuffers.vmlinuzName} (auto)`
+                          : 'Auto-extracted or pick'}
                     </div>
                     <div className="text-[11px] font-mono tabular-nums text-slate-500 mt-0.5">
-                      {vmlinuzFile ? formatBytes(vmlinuzFile.size) : 'Required · ~6–10 MB'}
+                      {vmlinuzFile
+                        ? formatBytes(vmlinuzFile.size)
+                        : extractedBuffers
+                          ? formatBytes(extractedBuffers.vmlinuzBuffer.byteLength)
+                          : 'Auto from .iso · ~6–10 MB'}
                     </div>
                     <input
                       type="file"
@@ -247,10 +298,18 @@ export const PuppySetupModal: React.FC<PuppySetupModalProps> = ({
                   <label className="p-3 rounded-md bg-slate-950 border border-slate-800 hover:border-slate-600 cursor-pointer block">
                     <div className="font-mono text-[11px] text-slate-400">Ramdisk (initrd)</div>
                     <div className="font-medium text-slate-100 mt-1 truncate">
-                      {initrdFile ? initrdFile.name : 'Select initrd.gz'}
+                      {initrdFile
+                        ? initrdFile.name
+                        : extractedBuffers
+                          ? `${extractedBuffers.initrdName} (auto)`
+                          : 'Auto-extracted or pick'}
                     </div>
                     <div className="text-[11px] font-mono tabular-nums text-slate-500 mt-0.5">
-                      {initrdFile ? formatBytes(initrdFile.size) : 'Required · ~2–4 MB'}
+                      {initrdFile
+                        ? formatBytes(initrdFile.size)
+                        : extractedBuffers
+                          ? formatBytes(extractedBuffers.initrdBuffer.byteLength)
+                          : 'Auto from .iso · ~2–4 MB'}
                     </div>
                     <input
                       type="file"
@@ -265,25 +324,33 @@ export const PuppySetupModal: React.FC<PuppySetupModalProps> = ({
                   </label>
 
                   <label className="p-3 rounded-md bg-slate-950 border border-slate-800 hover:border-slate-600 cursor-pointer block">
-                    <div className="font-mono text-[11px] text-slate-400">SFS Medium (async CD)</div>
+                    <div className="font-mono text-[11px] text-slate-400">Puppy ISO (2 MB Read-Ahead)</div>
                     <div className="font-medium text-slate-100 mt-1 truncate">
                       {isoFile ? isoFile.name : 'Select Puppy .iso'}
                     </div>
                     <div className="text-[11px] font-mono tabular-nums text-slate-500 mt-0.5">
-                      {isoFile ? `${formatBytes(isoFile.size)} (streamed)` : 'Required · Async slice read'}
+                      {isoFile ? `${formatBytes(isoFile.size)} (cached stream)` : 'Just pick .iso — auto-extracts'}
                     </div>
                     <input
                       type="file"
                       accept=".iso,.img"
                       onChange={(e) => {
                         const f = e.target.files?.[0];
-                        if (f) setIsoFile(f);
+                        if (f) {
+                          setIsoFile(f);
+                          void tryAutoExtractFromIso(f);
+                        }
                         e.target.value = '';
                       }}
                       className="hidden"
                     />
                   </label>
                 </div>
+                {extractNote && (
+                  <div className="text-[11px] font-mono text-emerald-400 bg-emerald-950/30 border border-emerald-800/50 rounded px-3 py-1.5">
+                    {extractNote}
+                  </div>
+                )}
               </div>
 
               {/* Guardrailed RAM + Networking */}

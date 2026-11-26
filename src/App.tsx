@@ -46,6 +46,11 @@ import {
   sanitizeGuestFilename,
   writeFileToVm9p,
 } from './lib/guestBridge';
+import {
+  FAST_PUPPY_CMDLINE,
+  attachFastIsoReadAheadCache,
+  inspectAndExtractPuppyIso,
+} from './lib/isoPuppyExtractor';
 import { EmulatorToolbar } from './components/EmulatorToolbar';
 import { VirtualKeyboard } from './components/VirtualKeyboard';
 import { TouchMouseBar } from './components/TouchMouseBar';
@@ -94,6 +99,7 @@ export default function App() {
   // Unified mouse button state (shared by physical mouse, trackpad, touch drag, and thumb hold button)
   const mouseButtonsRef = useRef({ left: false, middle: false, right: false });
   const thumbLeftHeldRef = useRef(false);
+  const vmwareAbsoluteMouseRef = useRef(false);
   const pointerPosRef = useRef<{ x: number; y: number; initialized: boolean }>({
     x: 0,
     y: 0,
@@ -167,6 +173,8 @@ export default function App() {
     localFile?: File | null;
     vmlinuzFile?: File | null;
     initrdFile?: File | null;
+    vmlinuzBuffer?: ArrayBuffer;
+    initrdBuffer?: ArrayBuffer;
     device: BootDevice;
     ramMb: number;
     vramMb: number;
@@ -243,6 +251,15 @@ export default function App() {
       const y = Math.max(0, Math.min(rect.height, clientY - rect.top));
       emu.bus.send('mouse-absolute', [x, y, rect.width, rect.height]);
     }
+  }, []);
+
+  // Linux's vmmouse driver drains VMMouse.queue on PS/2 IRQ 12; re-sending current button state triggers IRQ 12 cleanly
+  const pokeVmmouseIrq = useCallback(() => {
+    if (!vmwareAbsoluteMouseRef.current || document.pointerLockElement) return;
+    const emu = emulatorRef.current;
+    if (!emu?.bus) return;
+    const b = mouseButtonsRef.current;
+    emu.bus.send('mouse-click', [b.left, b.middle, b.right]);
   }, []);
 
   const emitMouseWheel = useCallback((deltaY: number) => {
@@ -445,7 +462,9 @@ export default function App() {
       setIsFullscreen(Boolean(doc.fullscreenElement || doc.webkitFullscreenElement));
     };
     const handlePointerLockChange = () => {
-      setIsPointerLocked(Boolean(document.pointerLockElement));
+      const locked = Boolean(document.pointerLockElement);
+      setIsPointerLocked(locked);
+      emulatorRef.current?.bus?.send('mouse-pointer-lock', locked);
     };
 
     document.addEventListener('fullscreenchange', handleFullscreenChange);
@@ -478,6 +497,7 @@ export default function App() {
     }
     mouseButtonsRef.current = { left: false, middle: false, right: false };
     thumbLeftHeldRef.current = false;
+    vmwareAbsoluteMouseRef.current = false;
     setLeftButtonHeldUi(false);
 
     const emu = emulatorRef.current;
@@ -559,6 +579,8 @@ export default function App() {
       localFile?: File | null;
       vmlinuzFile?: File | null;
       initrdFile?: File | null;
+      vmlinuzBuffer?: ArrayBuffer;
+      initrdBuffer?: ArrayBuffer;
       device: BootDevice;
       ramMb: number;
       vramMb: number;
@@ -583,24 +605,6 @@ export default function App() {
       setStatus('loading');
       setIps(0);
       setActiveImageLabel(options.label);
-      activeBootKindRef.current = options.kind;
-      lastBootOptionsRef.current = {
-        kind: options.kind,
-        sourceUrl: options.sourceUrl,
-        localFile: options.localFile,
-        vmlinuzFile: options.vmlinuzFile,
-        initrdFile: options.initrdFile,
-        device: options.device,
-        ramMb: options.ramMb,
-        vramMb: options.vramMb,
-        sizeHint: options.sizeHint,
-        label: options.label,
-        cmdline: options.cmdline,
-        filesystemBaseUrl: options.filesystemBaseUrl,
-        netDeviceType: options.netDeviceType,
-        networkRelayUrl: options.networkRelayUrl,
-        bootHint: options.bootHint,
-      };
 
       await destroyCurrentEmulator();
 
@@ -608,6 +612,59 @@ export default function App() {
       abortControllerRef.current = controller;
 
       try {
+        // Automatically detect Puppy Linux ISOs (e.g. NoblePup32, BookwormPup32) and direct-boot vmlinuz + initrd
+        // with pfix=ram,nocopy so Puppy never spends 4+ minutes copying 350 MB of .sfs layers into guest RAM.
+        let effectiveKind: PresetKind = options.kind;
+        let effectiveVmlinuzBuffer = options.vmlinuzBuffer;
+        let effectiveInitrdBuffer = options.initrdBuffer;
+        let effectiveCmdline = options.cmdline;
+        let effectiveBootHint = options.bootHint;
+
+        if (
+          effectiveKind === 'disk' &&
+          options.device === 'cdrom' &&
+          options.localFile &&
+          options.localFile.name.toLowerCase().endsWith('.iso')
+        ) {
+          setDownloadProgress({
+            fileName: `Inspecting ${options.localFile.name}`,
+            loaded: 0,
+            total: 0,
+            percent: null,
+          });
+          const extracted = await inspectAndExtractPuppyIso(options.localFile);
+          if (controller.signal.aborted) return;
+          if (extracted) {
+            effectiveKind = 'puppy-direct';
+            effectiveVmlinuzBuffer = extracted.vmlinuzBuffer;
+            effectiveInitrdBuffer = extracted.initrdBuffer;
+            effectiveCmdline = effectiveCmdline || FAST_PUPPY_CMDLINE;
+            effectiveBootHint =
+              'Fast Puppy Direct Boot active (pfix=ram,nocopy + 2 MB ISO read-ahead cache). Tip: use State → Save Snapshot at the desktop for 2-second future boots.';
+          }
+        }
+
+        activeBootKindRef.current = effectiveKind;
+        lastBootOptionsRef.current = {
+          kind: effectiveKind,
+          sourceUrl: options.sourceUrl,
+          localFile: options.localFile,
+          vmlinuzFile: options.vmlinuzFile,
+          initrdFile: options.initrdFile,
+          vmlinuzBuffer: effectiveVmlinuzBuffer,
+          initrdBuffer: effectiveInitrdBuffer,
+          device: options.device,
+          ramMb: options.ramMb,
+          vramMb: options.vramMb,
+          sizeHint: options.sizeHint,
+          label: options.label,
+          cmdline: effectiveCmdline,
+          filesystemBaseUrl: options.filesystemBaseUrl,
+          netDeviceType: options.netDeviceType,
+          networkRelayUrl: options.networkRelayUrl,
+          bootHint: effectiveBootHint,
+        };
+
         setDownloadProgress({
           fileName: 'SeaBIOS & VGA BIOS',
           loaded: 0,
@@ -632,13 +689,13 @@ export default function App() {
         // State-9p presets (e.g. Arch Linux) must match the snapshot's exact RAM/VRAM topology.
         // Puppy direct-kernel mode enforces iPadOS WebKit 256-512 MB guardrails.
         const effectiveRamMb =
-          options.kind === 'state-9p'
+          effectiveKind === 'state-9p'
             ? 512
-            : options.kind === 'puppy-direct'
+            : effectiveKind === 'puppy-direct'
               ? Math.min(512, Math.max(256, options.ramMb))
               : options.ramMb;
         const effectiveVramMb =
-          options.kind === 'state-9p' || options.kind === 'puppy-direct' ? 8 : options.vramMb;
+          effectiveKind === 'state-9p' || effectiveKind === 'puppy-direct' ? 8 : options.vramMb;
 
         const config: V86Config = {
           wasm_path: V86_ASSETS.wasmUrl,
@@ -656,7 +713,7 @@ export default function App() {
 
         // Automatic network configuration on ALL Puppy Linux & local ISOs (ne2k_pci + fetch auto-DHCP by default)
         const shouldAttachNet =
-          networkEnabled || options.kind === 'puppy-direct' || Boolean(options.localFile);
+          networkEnabled || effectiveKind === 'puppy-direct' || Boolean(options.localFile);
         if (shouldAttachNet) {
           config.net_device = {
             type: options.netDeviceType ?? netDeviceType,
@@ -691,7 +748,7 @@ export default function App() {
           return buildFat16DiskImage(rootEntries, wwwEntries, 'IPAD_FILES');
         };
 
-        if (options.kind === 'state-9p') {
+        if (effectiveKind === 'state-9p') {
           if (options.filesystemBaseUrl) {
             config.filesystem = { baseurl: options.filesystemBaseUrl };
           }
@@ -701,18 +758,22 @@ export default function App() {
             };
           }
           config.preserve_mac_from_state_image = true;
-        } else if (options.kind === 'puppy-direct') {
-          // Direct kernel + initrd boot alongside async-streamed CD-ROM ISO (no double-buffering in iPadOS RAM)
-          if (options.vmlinuzFile) {
+        } else if (effectiveKind === 'puppy-direct') {
+          // Direct kernel + initrd boot alongside async-streamed CD-ROM ISO (with 2 MB read-ahead LRU cache)
+          if (effectiveVmlinuzBuffer) {
+            config.bzimage = { buffer: effectiveVmlinuzBuffer, async: false };
+          } else if (options.vmlinuzFile) {
             config.bzimage = { buffer: options.vmlinuzFile };
           }
-          if (options.initrdFile) {
+          if (effectiveInitrdBuffer) {
+            config.initrd = { buffer: effectiveInitrdBuffer, async: false };
+          } else if (options.initrdFile) {
             config.initrd = { buffer: options.initrdFile };
           }
           if (options.localFile) {
             config.cdrom = { buffer: options.localFile, async: true };
           }
-          config.cmdline = options.cmdline;
+          config.cmdline = effectiveCmdline || FAST_PUPPY_CMDLINE;
           // Enable live 9p share (+ optional compact FAT16 drive if enabled/populated)
           config.filesystem = {};
           const fatDrive = buildHelperDriveIfEnabled();
@@ -722,22 +783,22 @@ export default function App() {
           if (options.initialStateBuffer) {
             config.initial_state = { buffer: options.initialStateBuffer };
           }
-        } else if (options.kind === 'bzimage') {
+        } else if (effectiveKind === 'bzimage') {
           if (downloadedBuffer) {
             config.bzimage = { buffer: downloadedBuffer, async: false };
           }
-          config.cmdline = options.cmdline;
+          config.cmdline = effectiveCmdline;
           config.filesystem = {};
           if (options.initialStateBuffer) {
             config.initial_state = { buffer: options.initialStateBuffer };
           }
         } else {
-          // Standard ISO / IMG / Floppy boot (stream large local files via AsyncFileBuffer to protect iPadOS RAM)
+          // Standard ISO / IMG / Floppy boot (stream large local files via AsyncFileBuffer + 2 MB read-ahead cache)
           config.boot_order = BOOT_ORDER[options.device];
           const diskPayload = options.localFile ?? downloadedBuffer;
           if (diskPayload) {
             const useAsyncFileBuffer = Boolean(
-              options.localFile && options.localFile.size >= 64 * 1024 * 1024
+              options.localFile && options.localFile.size >= 128 * 1024 * 1024
             );
             config[options.device] = {
               buffer: diskPayload,
@@ -771,9 +832,20 @@ export default function App() {
         lastTickRef.current = performance.now();
         lastInstrRef.current = 0;
 
+        const isoFileForCache =
+          options.localFile && (effectiveKind === 'puppy-direct' || options.device === 'cdrom')
+            ? options.localFile
+            : null;
+        const installIsoCache = () => {
+          if (isoFileForCache) {
+            attachFastIsoReadAheadCache(emulator, isoFileForCache);
+          }
+        };
+
         let hintShown = false;
         let synced9pOnce = false;
         const markRunning = (allowSync9p: boolean) => {
+          installIsoCache();
           setDownloadProgress(null);
           setStatus('running');
           lastTickRef.current = performance.now();
@@ -781,13 +853,13 @@ export default function App() {
           window.requestAnimationFrame(() => fitScreenToViewport());
           window.setTimeout(() => fitScreenToViewport(), 250);
           // Only sync 9p AFTER emulator-loaded (never before restore_state!) and never mutate Arch state-9p on boot
-          if (allowSync9p && !synced9pOnce && options.kind !== 'state-9p' && config.filesystem) {
+          if (allowSync9p && !synced9pOnce && effectiveKind !== 'state-9p' && config.filesystem) {
             synced9pOnce = true;
             void syncAllFilesToVm9p(emulator);
           }
-          if (!hintShown && options.bootHint) {
+          if (!hintShown && effectiveBootHint) {
             hintShown = true;
-            showToast(options.bootHint, 'info');
+            showToast(effectiveBootHint, 'info');
           }
         };
 
@@ -808,9 +880,17 @@ export default function App() {
           setDownloadProgress({ fileName, loaded, total, percent });
         });
 
+        // Attach 32 MB sliding read-ahead ISO cache as soon as devices.cdrom exists (without mutating UI/9p yet)
+        emulator.add_listener('emulator-ready', () => installIsoCache());
+
         // Wait for emulator-loaded / emulator-started (fires AFTER restore_state and v86.run())
         emulator.add_listener('emulator-loaded', () => markRunning(true));
         emulator.add_listener('emulator-started', () => markRunning(false));
+
+        // Track VMware VMMouse absolute pointer mode (used automatically by NoblePup32, BookwormPup32, modern Linux 6.x)
+        emulator.add_listener('vmware-absolute-mouse', (enabled: unknown) => {
+          vmwareAbsoluteMouseRef.current = Boolean(enabled);
+        });
 
         // Real v86 ScreenAdapter resize/mode events
         emulator.add_listener('screen-set-size-graphical', () => {
@@ -1127,6 +1207,8 @@ export default function App() {
         localFile: params.isoFile,
         vmlinuzFile: params.vmlinuzFile,
         initrdFile: params.initrdFile,
+        vmlinuzBuffer: params.vmlinuzBuffer,
+        initrdBuffer: params.initrdBuffer,
         device: 'cdrom',
         ramMb: safeRamMb,
         vramMb: params.vramMb,
@@ -1135,7 +1217,7 @@ export default function App() {
         netDeviceType: params.netDeviceType,
         networkRelayUrl: params.networkRelayUrl,
         bootHint:
-          'Puppy direct boot active: auto-network, live 9p (/mnt/ipad), and IPAD_FILES (/dev/sda) attached.',
+          'Puppy direct boot active (pfix=ram,nocopy + 2 MB ISO read-ahead cache). Tip: use State → Save Snapshot once at desktop for 2-second future boots.',
       });
     },
     [bootEmulator]
@@ -1410,6 +1492,7 @@ export default function App() {
 
   // --- UNIFIED PRECISION POINTER DRIVER (Desktop Mouse / iPad Magic Keyboard Trackpad / Apple Pencil) ---
   const handleViewportPointerDown = (e: React.PointerEvent<HTMLElement>) => {
+    if ((e.target as HTMLElement | null)?.closest('[data-touch-mouse-bar="true"]')) return;
     if (openMenu) setOpenMenu(null);
     if (status !== 'running' || !emulatorRef.current) return;
     if (e.pointerType === 'touch' || document.pointerLockElement) return;
@@ -1433,6 +1516,7 @@ export default function App() {
   };
 
   const handleViewportPointerMove = (e: React.PointerEvent<HTMLElement>) => {
+    if ((e.target as HTMLElement | null)?.closest('[data-touch-mouse-bar="true"]')) return;
     if (status !== 'running' || !emulatorRef.current) return;
     if (e.pointerType === 'touch' || document.pointerLockElement) return;
 
@@ -1446,11 +1530,16 @@ export default function App() {
     }
     pointerPosRef.current = { x: e.clientX, y: e.clientY, initialized: true };
 
-    emitMouseDelta(dx, dy);
+    // Send mouse-absolute BEFORE mouse-delta so VMMouse.queue is populated before PS/2 IRQ 12 fires
     emitMouseAbsolute(e.clientX, e.clientY);
+    emitMouseDelta(dx, dy);
+    if (vmwareAbsoluteMouseRef.current && Math.abs(dx) < 1 && Math.abs(dy) < 1) {
+      pokeVmmouseIrq();
+    }
   };
 
   const handleViewportPointerUp = (e: React.PointerEvent<HTMLElement>) => {
+    if ((e.target as HTMLElement | null)?.closest('[data-touch-mouse-bar="true"]')) return;
     if (status !== 'running' || !emulatorRef.current) return;
     if (e.pointerType === 'touch' || document.pointerLockElement) return;
 
@@ -1498,7 +1587,7 @@ export default function App() {
     return list;
   };
 
-  // --- UNIFIED PRECISION TOUCH DRIVER (iPadOS Touchscreen: Move, Tap, Double-Tap+Drag, Drag+L-Click Mode, 550ms Long-Press & 2-Finger R-Click, 2-Finger Scroll) ---
+  // --- UNIFIED PRECISION TOUCH DRIVER (iPadOS Touchscreen: VMMouse 1:1 Absolute + PS/2 Relative, Tap, Double-Tap+Drag, Drag+L-Click Mode, 550ms Long-Press & 2-Finger R-Click, 2-Finger Scroll) ---
   const clearLongPressTimer = () => {
     if (touchStateRef.current.longPressTimer !== null) {
       window.clearTimeout(touchStateRef.current.longPressTimer);
@@ -1540,22 +1629,30 @@ export default function App() {
       scrollAccumY: 0,
     };
 
+    // Always position VMMouse absolute pointer (NoblePup32 / BookwormPup32 / modern Linux) at touch point first
+    emitMouseAbsolute(touch.clientX, touch.clientY);
+
     if (engageLeftDrag) {
       emitMouseButtons(true, false, false);
       setLeftButtonHeldUi(true);
-    } else if (vTouches.length === 1 && !thumbLeftHeldRef.current) {
-      touchStateRef.current.longPressTimer = window.setTimeout(() => {
-        const ts = touchStateRef.current;
-        if (ts.active && !ts.moved && ts.maxTouches === 1 && !ts.holdingLeftForDrag) {
-          ts.longPressFired = true;
-          ts.longPressTimer = null;
-          emitMouseButtons(false, false, true);
-          window.setTimeout(
-            () => emitMouseButtons(thumbLeftHeldRef.current, false, false),
-            50
-          );
-        }
-      }, 550);
+    } else {
+      // Wake VMMouse IRQ 12 immediately so the cursor jumps to finger position on first contact
+      pokeVmmouseIrq();
+      if (vTouches.length === 1 && !thumbLeftHeldRef.current) {
+        touchStateRef.current.longPressTimer = window.setTimeout(() => {
+          const ts = touchStateRef.current;
+          if (ts.active && !ts.moved && ts.maxTouches === 1 && !ts.holdingLeftForDrag) {
+            ts.longPressFired = true;
+            ts.longPressTimer = null;
+            emitMouseAbsolute(ts.startX, ts.startY);
+            emitMouseButtons(false, false, true);
+            window.setTimeout(
+              () => emitMouseButtons(thumbLeftHeldRef.current, false, false),
+              50
+            );
+          }
+        }, 550);
+      }
     }
   };
 
@@ -1594,7 +1691,12 @@ export default function App() {
 
     if (dx !== 0 || dy !== 0) {
       const speed = ts.holdingLeftForDrag || thumbLeftHeldRef.current ? 1.15 : 1.4;
+      // Queue VMMouse absolute coordinates BEFORE triggering PS/2 IRQ 12 via mouse-delta
+      emitMouseAbsolute(touch.clientX, touch.clientY);
       emitMouseDelta(dx * speed, dy * speed);
+      if (vmwareAbsoluteMouseRef.current && Math.abs(dx * speed) < 1 && Math.abs(dy * speed) < 1) {
+        pokeVmmouseIrq();
+      }
     }
   };
 
@@ -1613,6 +1715,7 @@ export default function App() {
         emitMouseButtons(thumbLeftHeldRef.current, false, false);
         setLeftButtonHeldUi(thumbLeftHeldRef.current);
       } else if (status === 'running' && !ts.longPressFired && !ts.moved && elapsed < 300) {
+        emitMouseAbsolute(ts.startX, ts.startY);
         if (ts.maxTouches >= 2) {
           // Two-finger tap -> Right Click
           emitMouseButtons(false, false, true);
