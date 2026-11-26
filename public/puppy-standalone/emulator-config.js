@@ -1,10 +1,10 @@
 /**
  * Production v86 (32-bit i686 Puppy Linux) & Optional QEMU-Wasm (64-bit VoidPup64)
- * Configuration tuned for iPadOS Safari / WebKit memory guardrails (256-512 MB cap).
+ * Configuration tuned for iPadOS Safari / WebKit (256 MB - 2 GB RAM).
  */
 
 export const IPADOS_RAM_MIN_MB = 256;
-export const IPADOS_RAM_MAX_MB = 512;
+export const IPADOS_RAM_MAX_MB = 2048;
 
 // Primary Configuration: v86 Single-Threaded Wasm (NO COOP/COEP / SharedArrayBuffer required)
 // Target: BookwormPup32 or NoblePup32 (32-bit i686 Xorg/JWM)

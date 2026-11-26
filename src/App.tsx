@@ -686,14 +686,12 @@ export default function App() {
 
         resetScreenContainerDom();
 
-        // State-9p presets (e.g. Arch Linux) must match the snapshot's exact RAM/VRAM topology.
-        // Puppy direct-kernel mode enforces iPadOS WebKit 256-512 MB guardrails.
+        // State-9p presets (e.g. Arch Linux) must match the snapshot's exact RAM/VRAM topology (512 MB).
+        // All other Linux presets, local ISOs, and Puppy direct-kernel boots support up to 2048 MB (2 GB).
         const effectiveRamMb =
           effectiveKind === 'state-9p'
             ? 512
-            : effectiveKind === 'puppy-direct'
-              ? Math.min(512, Math.max(256, options.ramMb))
-              : options.ramMb;
+            : Math.min(2048, Math.max(256, options.ramMb));
         const effectiveVramMb =
           effectiveKind === 'state-9p' || effectiveKind === 'puppy-direct' ? 8 : options.vramMb;
 
@@ -1194,7 +1192,7 @@ export default function App() {
 
   const handleBootPuppyDirect = useCallback(
     (params: PuppyDirectBootParams) => {
-      const safeRamMb = Math.min(512, Math.max(256, params.memoryMb));
+      const safeRamMb = Math.min(2048, Math.max(256, params.memoryMb));
       localFileRef.current = params.isoFile;
       setLocalFileName(params.isoFile.name);
       setBootDevice('cdrom');
@@ -1999,7 +1997,7 @@ export default function App() {
                   </h1>
                 </div>
                 <p className="text-sm text-slate-400 max-w-2xl leading-relaxed">
-                  Run full rolling Arch Linux, modern 2024 SliTaz Openbox X11, Linux 6.8, or local Puppy Linux ISOs inside WebAssembly—tuned for Apple Silicon M3 Chrome with touch drag-and-click, double-tap drag, and up to 1 GB RAM.
+                  Run full rolling Arch Linux, modern 2024 SliTaz Openbox X11, Linux 6.8, or local Puppy Linux ISOs inside WebAssembly—tuned for Apple Silicon M3 Chrome with touch drag-and-click, double-tap drag, and up to 2 GB RAM.
                 </p>
               </div>
 
@@ -2060,7 +2058,7 @@ export default function App() {
                   </h2>
                   <p className="text-xs text-slate-400 mt-1">
                     Drop any <span className="font-mono text-slate-300">.iso</span> or{' '}
-                    <span className="font-mono text-slate-300">.img</span> file here, or use Direct Kernel Boot for BookwormPup32 / NoblePup32 with iPadOS 256–512 MB guardrails.
+                    <span className="font-mono text-slate-300">.img</span> file here, or use Direct Kernel Boot for BookwormPup32 / NoblePup32 with up to 2 GB RAM.
                   </p>
                 </div>
                 <div className="flex flex-wrap items-center gap-2 shrink-0">

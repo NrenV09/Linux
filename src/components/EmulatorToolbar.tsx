@@ -242,7 +242,7 @@ export const EmulatorToolbar: React.FC<EmulatorToolbarProps> = ({
           <button
             type="button"
             onClick={onOpenPuppySetup}
-            title="Puppy Linux iPadOS WebKit setup (direct vmlinuz + initrd + async ISO, 256-512 MB cap & QEMU-Wasm config)"
+            title="Puppy Linux iPadOS WebKit setup (direct vmlinuz + initrd + async ISO, up to 2 GB RAM & QEMU-Wasm config)"
             className={`${btnBase} bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700`}
           >
             <Cpu className="w-3.5 h-3.5 text-emerald-400" />
@@ -487,12 +487,12 @@ export const EmulatorToolbar: React.FC<EmulatorToolbarProps> = ({
                           : 'text-slate-400 hover:text-slate-200'
                       }`}
                     >
-                      {mb >= 1024 ? '1 GB' : `${mb}`}
+                      {mb >= 1024 ? `${mb / 1024} GB` : `${mb}`}
                     </button>
                   ))}
                 </div>
                 <p className="text-[11px] text-slate-500 mt-1">
-                  512 MB–1 GB ideal for M3 iPad Air (Arch state uses fixed 512 MB).
+                  Up to 2 GB RAM for 8 GB M3 iPad Air (Arch snapshot uses fixed 512 MB).
                 </p>
               </div>
 

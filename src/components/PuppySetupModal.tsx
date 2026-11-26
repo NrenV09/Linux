@@ -203,7 +203,7 @@ export const PuppySetupModal: React.FC<PuppySetupModalProps> = ({
               Puppy Linux iPadOS WebKit Setup (BookwormPup32 / NoblePup32)
             </h2>
             <p className="text-xs text-slate-400 mt-0.5">
-              Direct kernel + initrd boot with async ISO streaming &amp; strict 256–512 MB Safari RAM cap
+              Direct kernel + initrd boot with async ISO streaming &amp; configurable RAM up to 2 GB
             </p>
           </div>
           <button
@@ -246,10 +246,10 @@ export const PuppySetupModal: React.FC<PuppySetupModalProps> = ({
                 <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
                 <div className="space-y-1 text-slate-300 leading-relaxed">
                   <div className="font-medium text-slate-100">
-                    iPadOS Safari / WebKit Memory Guardrails Active
+                    iPadOS Safari / WebKit Memory Optimization
                   </div>
                   <p className="text-slate-400">
-                    Guest RAM is capped at 256–512 MB, <span className="font-mono text-slate-200">pfix=ram,nocopy</span> prevents Puppy from duplicating <span className="font-mono text-slate-200">.sfs</span> layers into guest RAM, and the ISO mounts via <span className="font-mono text-slate-200">AsyncFileBuffer</span> (on-demand 256 KB slices) instead of buffering the entire ISO twice in browser memory.
+                    Guest RAM scales from 256 MB up to 2 GB, <span className="font-mono text-slate-200">pfix=ram,nocopy</span> prevents Puppy from duplicating <span className="font-mono text-slate-200">.sfs</span> layers into guest RAM, and the ISO mounts via 2 MB cached <span className="font-mono text-slate-200">AsyncFileBuffer</span> slices instead of buffering the entire ISO twice in browser memory.
                   </p>
                 </div>
               </div>
@@ -357,10 +357,10 @@ export const PuppySetupModal: React.FC<PuppySetupModalProps> = ({
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
                 <div>
                   <div className="font-semibold text-slate-300 mb-1.5">
-                    iPadOS Guardrailed RAM
+                    Guest RAM (Up to 2 GB)
                   </div>
                   <div className="flex items-center gap-1 p-1 bg-slate-950 rounded-md border border-slate-800">
-                    {[256, 384, 512].map((mb) => (
+                    {[512, 1024, 1536, 2048].map((mb) => (
                       <button
                         key={mb}
                         type="button"
@@ -371,7 +371,7 @@ export const PuppySetupModal: React.FC<PuppySetupModalProps> = ({
                             : 'text-slate-400 hover:text-slate-200'
                         }`}
                       >
-                        {mb} MB
+                        {mb >= 1024 ? `${mb / 1024}G` : `${mb}M`}
                       </button>
                     ))}
                   </div>

@@ -14,8 +14,8 @@ export const BOOT_ORDER: Record<BootDevice, number> = {
   fda: 0x321, // Floppy, CD, HD
 };
 
-// Tuned for Apple M3 iPad Air (8 GB unified RAM, WebKit per-tab WASM safe ceiling ~1 GB)
-export const RAM_OPTIONS_MB = [256, 512, 768, 1024] as const;
+// Tuned for Apple M3 iPad Air (8 GB unified RAM; v86 wasm supports up to 2 GB guest RAM)
+export const RAM_OPTIONS_MB = [256, 512, 1024, 1536, 2048] as const;
 export const VRAM_OPTIONS_MB = [8, 16] as const;
 
 export const OS_PRESETS: OSPreset[] = [
