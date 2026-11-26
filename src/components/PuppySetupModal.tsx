@@ -2,7 +2,11 @@ import React, { useState } from 'react';
 import { X, Play, Copy, Check, Download, HardDriveUpload, ShieldCheck } from 'lucide-react';
 import type { PuppyDirectBootParams } from '../types/v86';
 import { formatBytes } from '../lib/presets';
-import { FAST_PUPPY_CMDLINE, inspectAndExtractPuppyIso } from '../lib/isoPuppyExtractor';
+import {
+  FAST_PUPPY_CMDLINE,
+  buildPuppyCmdline,
+  inspectAndExtractPuppyIso,
+} from '../lib/isoPuppyExtractor';
 
 interface PuppySetupModalProps {
   open: boolean;
@@ -12,7 +16,7 @@ interface PuppySetupModalProps {
   onInputFocusChange: (focused: boolean) => void;
 }
 
-const DEFAULT_PUPPY_CMDLINE = FAST_PUPPY_CMDLINE;
+const DEFAULT_PUPPY_CMDLINE = buildPuppyCmdline(1024);
 
 const DIRECTORY_LAYOUT = `repo-root/
 ├── index.html                  # Standalone v86 iPadOS WebKit entry point
@@ -97,10 +101,11 @@ export const PuppySetupModal: React.FC<PuppySetupModalProps> = ({
   } | null>(null);
   const [extractNote, setExtractNote] = useState<string | null>(null);
   const [isoFile, setIsoFile] = useState<File | null>(null);
-  const [memoryMb, setMemoryMb] = useState<number>(512);
+  const [memoryMb, setMemoryMb] = useState<number>(1024);
   const [netDeviceType, setNetDeviceType] = useState<'ne2k' | 'virtio'>('ne2k');
   const [networkRelayUrl, setNetworkRelayUrl] = useState<string>('fetch');
   const [cmdline, setCmdline] = useState<string>(DEFAULT_PUPPY_CMDLINE);
+  const [cmdlineEdited, setCmdlineEdited] = useState<boolean>(false);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
 
   if (!open) return null;
@@ -176,8 +181,8 @@ export const PuppySetupModal: React.FC<PuppySetupModalProps> = ({
       initrdBuffer: initrdFile ? undefined : extractedBuffers?.initrdBuffer,
       isoFile,
       memoryMb,
-      vramMb: 8,
-      cmdline: cmdline.trim() || DEFAULT_PUPPY_CMDLINE,
+      vramMb: 16,
+      cmdline: cmdline.trim() || buildPuppyCmdline(memoryMb) || FAST_PUPPY_CMDLINE,
       netDeviceType,
       networkRelayUrl: networkRelayUrl.trim() || 'fetch',
     });
@@ -246,10 +251,10 @@ export const PuppySetupModal: React.FC<PuppySetupModalProps> = ({
                 <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
                 <div className="space-y-1 text-slate-300 leading-relaxed">
                   <div className="font-medium text-slate-100">
-                    iPadOS Safari / WebKit Memory Optimization
+                    RAM-Speed Mode &amp; Honest Browser Limits
                   </div>
                   <p className="text-slate-400">
-                    Guest RAM scales from 256 MB up to 2 GB, <span className="font-mono text-slate-200">pfix=ram,nocopy</span> prevents Puppy from duplicating <span className="font-mono text-slate-200">.sfs</span> layers into guest RAM, and the ISO mounts via 2 MB cached <span className="font-mono text-slate-200">AsyncFileBuffer</span> slices instead of buffering the entire ISO twice in browser memory.
+                    At <span className="font-mono text-slate-200">1–2 GB RAM</span>, Puppy boots with <span className="font-mono text-slate-200">pfix=ram,copy</span> and a synchronous ISO RAM buffer so apps/menus run from memory without CD-ROM I/O stalls. Note: iPadOS WebKit restricts all browsers to single-thread Wasm without Apple Metal GPU or Hypervisor.framework passthrough (which is why the iPad stays cool and 3D/compositing runs in software VGA).
                   </p>
                 </div>
               </div>
@@ -364,7 +369,12 @@ export const PuppySetupModal: React.FC<PuppySetupModalProps> = ({
                       <button
                         key={mb}
                         type="button"
-                        onClick={() => setMemoryMb(mb)}
+                        onClick={() => {
+                          setMemoryMb(mb);
+                          if (!cmdlineEdited) {
+                            setCmdline(buildPuppyCmdline(mb));
+                          }
+                        }}
                         className={`flex-1 h-7 rounded font-mono tabular-nums transition-colors ${
                           memoryMb === mb
                             ? 'bg-sky-600 text-white font-medium'
@@ -423,7 +433,10 @@ export const PuppySetupModal: React.FC<PuppySetupModalProps> = ({
                   id="puppy-cmdline"
                   type="text"
                   value={cmdline}
-                  onChange={(e) => setCmdline(e.target.value)}
+                  onChange={(e) => {
+                    setCmdline(e.target.value);
+                    setCmdlineEdited(true);
+                  }}
                   onFocus={() => onInputFocusChange(true)}
                   onBlur={() => onInputFocusChange(false)}
                   className="w-full h-9 px-3 rounded-md bg-slate-950 border border-slate-700 font-mono text-slate-100 focus:outline-none focus:border-sky-500"

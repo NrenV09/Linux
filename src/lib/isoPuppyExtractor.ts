@@ -8,8 +8,12 @@ export interface ExtractedPuppyIso {
   sfsFiles: string[];
 }
 
-export const FAST_PUPPY_CMDLINE =
-  'pfix=ram,nocopy pmedia=cd acpi=off tsc=reliable mitigations=off';
+export function buildPuppyCmdline(ramMb: number): string {
+  const ramFlag = ramMb >= 768 ? 'pfix=ram,copy' : 'pfix=ram,nocopy';
+  return `${ramFlag} pmedia=cd acpi=off noapic nolapic pci=noacpi i8042.nopnp=1 clocksource=tsc tsc=reliable mitigations=off`;
+}
+
+export const FAST_PUPPY_CMDLINE = buildPuppyCmdline(512);
 
 interface IsoDirEntry {
   name: string;

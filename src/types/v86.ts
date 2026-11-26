@@ -96,6 +96,7 @@ export interface V86Config {
   };
   initial_state?: V86ImageSource;
   boot_order?: number;
+  fastboot?: boolean;
   autostart?: boolean;
   acpi?: boolean;
   disable_jit?: boolean;

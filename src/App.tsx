@@ -47,8 +47,8 @@ import {
   writeFileToVm9p,
 } from './lib/guestBridge';
 import {
-  FAST_PUPPY_CMDLINE,
   attachFastIsoReadAheadCache,
+  buildPuppyCmdline,
   inspectAndExtractPuppyIso,
 } from './lib/isoPuppyExtractor';
 import { EmulatorToolbar } from './components/EmulatorToolbar';
@@ -251,15 +251,6 @@ export default function App() {
       const y = Math.max(0, Math.min(rect.height, clientY - rect.top));
       emu.bus.send('mouse-absolute', [x, y, rect.width, rect.height]);
     }
-  }, []);
-
-  // Linux's vmmouse driver drains VMMouse.queue on PS/2 IRQ 12; re-sending current button state triggers IRQ 12 cleanly
-  const pokeVmmouseIrq = useCallback(() => {
-    if (!vmwareAbsoluteMouseRef.current || document.pointerLockElement) return;
-    const emu = emulatorRef.current;
-    if (!emu?.bus) return;
-    const b = mouseButtonsRef.current;
-    emu.bus.send('mouse-click', [b.left, b.middle, b.right]);
   }, []);
 
   const emitMouseWheel = useCallback((deltaY: number) => {
@@ -635,12 +626,15 @@ export default function App() {
           const extracted = await inspectAndExtractPuppyIso(options.localFile);
           if (controller.signal.aborted) return;
           if (extracted) {
+            const targetRam = Math.min(2048, Math.max(256, options.ramMb));
             effectiveKind = 'puppy-direct';
             effectiveVmlinuzBuffer = extracted.vmlinuzBuffer;
             effectiveInitrdBuffer = extracted.initrdBuffer;
-            effectiveCmdline = effectiveCmdline || FAST_PUPPY_CMDLINE;
+            effectiveCmdline = effectiveCmdline || buildPuppyCmdline(targetRam);
             effectiveBootHint =
-              'Fast Puppy Direct Boot active (pfix=ram,nocopy + 2 MB ISO read-ahead cache). Tip: use State → Save Snapshot at the desktop for 2-second future boots.';
+              targetRam >= 768
+                ? 'Fast Puppy Direct Boot (pfix=ram,copy + RAM ISO): copies SquashFS into RAM once for instant menus/apps.'
+                : 'Puppy Direct Boot (pfix=ram,nocopy + 2 MB ISO cache): increase RAM to 1–2 GB in Linux & Hardware for full RAM speed.';
           }
         }
 
@@ -686,14 +680,13 @@ export default function App() {
 
         resetScreenContainerDom();
 
-        // State-9p presets (e.g. Arch Linux) must match the snapshot's exact RAM/VRAM topology (512 MB).
-        // All other Linux presets, local ISOs, and Puppy direct-kernel boots support up to 2048 MB (2 GB).
+        // State-9p presets (e.g. Arch Linux) must match the snapshot's exact RAM/VRAM topology (512 MB / 8 MB).
+        // All other Linux presets, local ISOs, and Puppy direct-kernel boots support up to 2048 MB (2 GB) & 16 MB VRAM.
         const effectiveRamMb =
           effectiveKind === 'state-9p'
             ? 512
             : Math.min(2048, Math.max(256, options.ramMb));
-        const effectiveVramMb =
-          effectiveKind === 'state-9p' || effectiveKind === 'puppy-direct' ? 8 : options.vramMb;
+        const effectiveVramMb = effectiveKind === 'state-9p' ? 8 : options.vramMb;
 
         const config: V86Config = {
           wasm_path: V86_ASSETS.wasmUrl,
@@ -702,6 +695,7 @@ export default function App() {
           screen_container: screenRef.current,
           bios: { buffer: bios },
           vga_bios: { buffer: vgaBios },
+          fastboot: effectiveKind !== 'state-9p',
           autostart: true,
           acpi: false,
           disable_jit: false,
@@ -769,9 +763,12 @@ export default function App() {
             config.initrd = { buffer: options.initrdFile };
           }
           if (options.localFile) {
-            config.cdrom = { buffer: options.localFile, async: true };
+            // At >=768 MB RAM on ISOs <=700 MB, load ISO into SyncFileBuffer (async: false) to eliminate async FileReader stalls
+            const syncIsoInRam =
+              effectiveRamMb >= 768 && options.localFile.size <= 700 * 1024 * 1024;
+            config.cdrom = { buffer: options.localFile, async: !syncIsoInRam };
           }
-          config.cmdline = effectiveCmdline || FAST_PUPPY_CMDLINE;
+          config.cmdline = effectiveCmdline || buildPuppyCmdline(effectiveRamMb);
           // Enable live 9p share (+ optional compact FAT16 drive if enabled/populated)
           config.filesystem = {};
           const fatDrive = buildHelperDriveIfEnabled();
@@ -791,12 +788,14 @@ export default function App() {
             config.initial_state = { buffer: options.initialStateBuffer };
           }
         } else {
-          // Standard ISO / IMG / Floppy boot (stream large local files via AsyncFileBuffer + 2 MB read-ahead cache)
+          // Standard ISO / IMG / Floppy boot (use SyncFileBuffer at >=768 MB for <=700 MB ISOs; otherwise 2 MB cached stream)
           config.boot_order = BOOT_ORDER[options.device];
           const diskPayload = options.localFile ?? downloadedBuffer;
           if (diskPayload) {
             const useAsyncFileBuffer = Boolean(
-              options.localFile && options.localFile.size >= 128 * 1024 * 1024
+              options.localFile &&
+                (options.localFile.size > 700 * 1024 * 1024 ||
+                  (effectiveRamMb < 768 && options.localFile.size >= 128 * 1024 * 1024))
             );
             config[options.device] = {
               buffer: diskPayload,
@@ -1528,12 +1527,10 @@ export default function App() {
     }
     pointerPosRef.current = { x: e.clientX, y: e.clientY, initialized: true };
 
-    // Send mouse-absolute BEFORE mouse-delta so VMMouse.queue is populated before PS/2 IRQ 12 fires
+    // Send mouse-absolute BEFORE mouse-delta so VMMouse.queue updates in-place (tail_is_move=true)
+    // and PS/2 IRQ 12 wakes Linux vmmouse without ever flooding the queue via mouse-click
     emitMouseAbsolute(e.clientX, e.clientY);
     emitMouseDelta(dx, dy);
-    if (vmwareAbsoluteMouseRef.current && Math.abs(dx) < 1 && Math.abs(dy) < 1) {
-      pokeVmmouseIrq();
-    }
   };
 
   const handleViewportPointerUp = (e: React.PointerEvent<HTMLElement>) => {
@@ -1634,8 +1631,11 @@ export default function App() {
       emitMouseButtons(true, false, false);
       setLeftButtonHeldUi(true);
     } else {
-      // Wake VMMouse IRQ 12 immediately so the cursor jumps to finger position on first contact
-      pokeVmmouseIrq();
+      // Trigger a zero-net PS/2 delta only when VMMouse is active so IRQ 12 warps the cursor immediately without mouse-click spam
+      if (vmwareAbsoluteMouseRef.current) {
+        emitMouseDelta(1, 0);
+        emitMouseDelta(-1, 0);
+      }
       if (vTouches.length === 1 && !thumbLeftHeldRef.current) {
         touchStateRef.current.longPressTimer = window.setTimeout(() => {
           const ts = touchStateRef.current;
@@ -1689,12 +1689,9 @@ export default function App() {
 
     if (dx !== 0 || dy !== 0) {
       const speed = ts.holdingLeftForDrag || thumbLeftHeldRef.current ? 1.15 : 1.4;
-      // Queue VMMouse absolute coordinates BEFORE triggering PS/2 IRQ 12 via mouse-delta
+      // Queue coalesced VMMouse absolute coords BEFORE triggering PS/2 IRQ 12 via mouse-delta
       emitMouseAbsolute(touch.clientX, touch.clientY);
       emitMouseDelta(dx * speed, dy * speed);
-      if (vmwareAbsoluteMouseRef.current && Math.abs(dx * speed) < 1 && Math.abs(dy * speed) < 1) {
-        pokeVmmouseIrq();
-      }
     }
   };
 
