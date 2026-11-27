@@ -171,7 +171,7 @@ export default function App() {
   const turboModeRef = useRef<boolean>(true);
   const [soundEnabled, setSoundEnabled] = useState<boolean>(false);
   const [netDeviceType, setNetDeviceType] = useState<'ne2k' | 'virtio'>('ne2k');
-  const [networkRelayUrl, setNetworkRelayUrl] = useState<string>('fetch');
+  const [networkRelayUrl, setNetworkRelayUrl] = useState<string>('wss://relay.widgetry.org/');
   const [attachTransferDrive, setAttachTransferDrive] = useState<boolean>(false);
   const [activeImageLabel, setActiveImageLabel] = useState<string>(DEFAULT_PRESET.name);
 
@@ -760,9 +760,16 @@ export default function App() {
           }
           config.preserve_mac_from_state_image = true;
         } else if (effectiveKind === 'puppy-direct') {
-          // Direct kernel + initrd boot alongside async-streamed CD-ROM ISO (with 2 MB read-ahead LRU cache)
+          // Direct kernel + initrd boot alongside async-streamed CD-ROM ISO (with 64 MB read-ahead LRU cache)
           if (effectiveVmlinuzBuffer) {
-            config.bzimage = { buffer: effectiveVmlinuzBuffer, async: false };
+            // Pad kernel buffer to 4-byte boundary so v86 Uint16Array/Uint32Array boot header reads never throw RangeError
+            let alignedKernel = effectiveVmlinuzBuffer;
+            if (alignedKernel.byteLength % 4 !== 0) {
+              const padded = new Uint8Array(Math.ceil(alignedKernel.byteLength / 4) * 4);
+              padded.set(new Uint8Array(alignedKernel));
+              alignedKernel = padded.buffer;
+            }
+            config.bzimage = { buffer: alignedKernel, async: false };
           } else if (options.vmlinuzFile) {
             config.bzimage = { buffer: options.vmlinuzFile };
           }
@@ -788,7 +795,13 @@ export default function App() {
           }
         } else if (effectiveKind === 'bzimage') {
           if (downloadedBuffer) {
-            config.bzimage = { buffer: downloadedBuffer, async: false };
+            let alignedKernel = downloadedBuffer;
+            if (alignedKernel.byteLength % 4 !== 0) {
+              const padded = new Uint8Array(Math.ceil(alignedKernel.byteLength / 4) * 4);
+              padded.set(new Uint8Array(alignedKernel));
+              alignedKernel = padded.buffer;
+            }
+            config.bzimage = { buffer: alignedKernel, async: false };
           }
           config.cmdline = effectiveCmdline;
           config.filesystem = {};

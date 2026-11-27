@@ -75,8 +75,10 @@ fi
 echo "[net-auto] Bringing up $IFACE..."
 ip link set "$IFACE" up 2>/dev/null || ifconfig "$IFACE" up 2>/dev/null
 
-# Attempt DHCP first (works with v86 fetch proxy 192.168.86.x and wss relay)
-if command -v udhcpc >/dev/null 2>&1; then
+# Attempt DHCP first (works with wss://relay.widgetry.org/ 10.5.x.x and v86 fetch proxy 192.168.86.x)
+if command -v pump >/dev/null 2>&1; then
+  pump -i "$IFACE" 2>/dev/null
+elif command -v udhcpc >/dev/null 2>&1; then
   udhcpc -i "$IFACE" -n -q -t 4 2>/dev/null
 elif command -v dhcpcd >/dev/null 2>&1; then
   dhcpcd -4 -t 6 "$IFACE" 2>/dev/null
@@ -104,7 +106,7 @@ export function buildAutoNetworkOneLiner(): string {
     `sh -c 'modprobe 8390 2>/dev/null; modprobe ne2k-pci 2>/dev/null; modprobe virtio_net 2>/dev/null; ` +
     `I=$(ls /sys/class/net | grep -v "^lo$" | head -n1); [ -n "$I" ] && (` +
     `ip link set "$I" up 2>/dev/null || ifconfig "$I" up; ` +
-    `(udhcpc -i "$I" -n -q -t 4 || dhcpcd -4 -t 5 "$I") 2>/dev/null || (` +
+    `(pump -i "$I" || udhcpc -i "$I" -n -q -t 4 || dhcpcd -4 -t 5 "$I") 2>/dev/null || (` +
     `ifconfig "$I" 192.168.86.100 netmask 255.255.255.0 up; ` +
     `route add default gw 192.168.86.1 2>/dev/null || ip route replace default via 192.168.86.1; ` +
     `printf "nameserver 192.168.86.1\\nnameserver 1.1.1.1\\n" > /etc/resolv.conf); ` +

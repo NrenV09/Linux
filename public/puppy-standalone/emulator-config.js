@@ -16,7 +16,7 @@ export function createPuppyV86Config({
   isoName = 'BookwormPup32.iso',
   isoSizeBytes = undefined,
   localFiles = null,
-  networkRelayUrl = 'fetch', // 'fetch' or 'wss://relay.widgetry.org/'
+  networkRelayUrl = 'wss://relay.widgetry.org/', // 'wss://relay.widgetry.org/' (Full Internet) or 'fetch'
   netDeviceType = 'ne2k', // 'ne2k' (built-in Puppy 32-bit) or 'virtio'
 }) {
   // Enforce strict iPadOS WebKit memory ceiling to avoid Jetsam tab kills

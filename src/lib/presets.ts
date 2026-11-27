@@ -47,6 +47,7 @@ export const OS_PRESETS: OSPreset[] = [
     recommendedRamMb: 512,
     recommendedVramMb: 8,
     graphical: true,
+    netDeviceType: 'ne2k',
     bootHint: 'Tiny Core boots straight into a super-fast X11 desktop (~10s).',
   },
   {
@@ -61,6 +62,7 @@ export const OS_PRESETS: OSPreset[] = [
     recommendedRamMb: 512,
     recommendedVramMb: 16,
     graphical: true,
+    netDeviceType: 'ne2k',
     bootHint: 'Press Enter at the SliTaz boot menu to launch the full 2024 Openbox desktop.',
   },
   {
@@ -75,6 +77,7 @@ export const OS_PRESETS: OSPreset[] = [
     recommendedRamMb: 512,
     recommendedVramMb: 8,
     graphical: false,
+    netDeviceType: 'ne2k',
     cmdline: 'tsc=reliable mitigations=off random.trust_cpu=on',
     bootHint: 'Modern Linux 6.8 kernel with rapid direct bzImage boot.',
   },
@@ -89,7 +92,8 @@ export const OS_PRESETS: OSPreset[] = [
     recommendedRamMb: 512,
     recommendedVramMb: 8,
     graphical: true,
-    bootHint: 'Press Enter at the DSL boot: prompt (or wait a few seconds) to enter the Fluxbox X11 desktop.',
+    netDeviceType: 'ne2k',
+    bootHint: 'Press Enter at boot: to load Fluxbox desktop. Full Internet (DHCP/DNS/ping/HTTP) auto-connects on eth0; note 2008 Dillo/wget only supports http:// sites (not TLS 1.3 https://).',
   },
   {
     id: 'kolibri',

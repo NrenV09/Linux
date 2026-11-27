@@ -307,20 +307,9 @@ export const GuestToolsModal: React.FC<GuestToolsModalProps> = ({
 
                   <div>
                     <label htmlFor="net-relay-input" className="block font-medium text-slate-300 mb-1.5">
-                      Browser Relay Backend (Built-in DHCP 192.168.86.x)
+                      Browser Relay Backend (Full Internet vs HTTP-Only)
                     </label>
-                    <div className="flex gap-1.5 mb-2">
-                      <button
-                        type="button"
-                        onClick={() => onNetworkRelayUrlChange('fetch')}
-                        className={`h-7 px-2.5 rounded border font-mono text-[11px] ${
-                          networkRelayUrl === 'fetch'
-                            ? 'bg-sky-600 border-sky-500 text-white'
-                            : 'bg-slate-900 border-slate-700 text-slate-300'
-                        }`}
-                      >
-                        fetch (Zero-Server Auto DHCP)
-                      </button>
+                    <div className="flex flex-wrap gap-1.5 mb-2">
                       <button
                         type="button"
                         onClick={() => onNetworkRelayUrlChange('wss://relay.widgetry.org/')}
@@ -330,7 +319,18 @@ export const GuestToolsModal: React.FC<GuestToolsModalProps> = ({
                             : 'bg-slate-900 border-slate-700 text-slate-300'
                         }`}
                       >
-                        wss://relay.widgetry.org/
+                        wss://relay.widgetry.org/ (Full Internet)
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => onNetworkRelayUrlChange('fetch')}
+                        className={`h-7 px-2.5 rounded border font-mono text-[11px] ${
+                          networkRelayUrl === 'fetch'
+                            ? 'bg-sky-600 border-sky-500 text-white'
+                            : 'bg-slate-900 border-slate-700 text-slate-300'
+                        }`}
+                      >
+                        fetch (CORS-Only Port 80)
                       </button>
                     </div>
                     <input
@@ -342,6 +342,9 @@ export const GuestToolsModal: React.FC<GuestToolsModalProps> = ({
                       onBlur={() => onInputFocusChange(false)}
                       className="w-full h-9 px-3 rounded-md bg-slate-900 border border-slate-700 font-mono text-slate-100 focus:outline-none focus:border-sky-500"
                     />
+                    <p className="text-[11px] text-slate-500 mt-1.5 leading-relaxed">
+                      <strong className="text-slate-300">wss://relay.widgetry.org/</strong> enables real DHCP (10.5.x.x), DNS, ICMP ping, TCP/HTTPS, and HTTP without browser CORS errors. <span className="font-mono">fetch</span> only supports port 80 CORS-enabled sites.
+                    </p>
                   </div>
                 </div>
 
@@ -350,7 +353,7 @@ export const GuestToolsModal: React.FC<GuestToolsModalProps> = ({
                     1-Click Guest Network Auto-Configurator
                   </div>
                   <p className="text-slate-400 leading-relaxed">
-                    Every Puppy ISO booted here automatically receives the <span className="font-mono text-slate-200">{netDeviceType === 'ne2k' ? 'ne2k_pci' : 'virtio-net'}</span> card, built-in DHCP server (<span className="font-mono text-slate-200">192.168.86.1</span>), and a ready-to-run <span className="font-mono text-slate-200">net-auto.sh</span> script on the <span className="font-mono text-slate-200">IPAD_FILES</span> desktop drive. If a Puppy ISO does not bring up <span className="font-mono text-slate-200">eth0</span> on its own, open Puppy&apos;s terminal (URxvt / LXTerminal) and click below:
+                    Every Linux preset &amp; local ISO automatically receives the <span className="font-mono text-slate-200">{netDeviceType === 'ne2k' ? 'ne2k_pci' : 'virtio-net'}</span> NIC and auto-DHCP (<span className="font-mono text-slate-200">pump</span> / <span className="font-mono text-slate-200">udhcpc</span> / <span className="font-mono text-slate-200">dhcpcd</span>). If an ISO does not bring up <span className="font-mono text-slate-200">eth0</span> on its own, open its terminal and click below:
                   </p>
 
                   <div className="flex flex-wrap items-center gap-2">
